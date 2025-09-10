@@ -4,6 +4,7 @@ import (
 	"flo/assessment/config/log"
 	_ "flo/assessment/config/mysql"
 	"flo/assessment/config/toml"
+	"flo/assessment/config/worker"
 	"flo/assessment/src/cron"
 	"flo/assessment/src/tools"
 	"fmt"
@@ -15,7 +16,6 @@ import (
 )
 
 func main() {
-
 	// Recover panics in main startup
 	defer func() {
 		if r := recover(); r != nil {
@@ -26,7 +26,13 @@ func main() {
 	// Initialize logger
 	log.InitLogger(toml.GetConfig().Log.Path, toml.GetConfig().Log.Level)
 
-	// Start cron jobs in a panic-safe goroutine
+	// Start worker pool
+	numWorkers := 5         // number of worker goroutines
+	jobQueueSize := 100     // max pending jobs
+	concurrencyPerFile := 5 // concurrency inside each file processing
+	worker.StartWorkerPool(numWorkers, jobQueueSize, concurrencyPerFile)
+
+	// Start cron jobs safely
 	tools.NewPanicGroup().Go(func() {
 		defer func() {
 			if r := recover(); r != nil {
