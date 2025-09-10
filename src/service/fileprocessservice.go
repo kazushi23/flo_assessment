@@ -29,16 +29,18 @@ type ProcessorOptions struct {
 	InsertTimeout     time.Duration // timeout for DB insert
 	ParseLocation     *time.Location
 	AllowEmptyReading bool // insert 0 for empty values if true
+	ProgressInterval  int
 }
 
 // DefaultProcessorOptions returns sane defaults
 func DefaultProcessorOptions() *ProcessorOptions {
 	loc, _ := time.LoadLocation("UTC")
 	return &ProcessorOptions{
-		BatchSize:         500,
+		BatchSize:         1000,
 		InsertTimeout:     30 * time.Second,
 		ParseLocation:     loc,
 		AllowEmptyReading: false,
+		ProgressInterval:  10000,
 	}
 }
 
@@ -49,6 +51,7 @@ type FileProcessServiceImpl struct {
 	batch       []entity.MeterReadingsEntity
 	batchMutex  sync.Mutex
 	concurrency int
+	sem         chan struct{}
 }
 
 // NewFileProcessServiceImpl creates a new service
@@ -61,6 +64,7 @@ func NewFileProcessServiceImpl(ctx context.Context, concurrency int, opts *Proce
 		opts:        opts,
 		concurrency: concurrency,
 		batch:       make([]entity.MeterReadingsEntity, 0, opts.BatchSize),
+		sem:         make(chan struct{}, concurrency),
 	}
 }
 
@@ -85,7 +89,6 @@ func (p *FileProcessServiceImpl) ProcessFileEntry(filePath string) error {
 	case ".csv":
 		return p.ProcessCsvFile(filePath)
 	default:
-		log.Logger.Error("wrong file type, only csv and zip allowed", zap.String("zipPath", filePath))
 		return fmt.Errorf("wrong file type, only csv and zip allowed")
 	}
 }
@@ -94,12 +97,10 @@ func (p *FileProcessServiceImpl) ProcessFileEntry(filePath string) error {
 func (p *FileProcessServiceImpl) ProcessZipFile(filePath string) error {
 	r, err := zip.OpenReader(filePath)
 	if err != nil {
-		log.Logger.Error("failed to open zip", zap.String("zipPath", filePath), zap.Error(err))
 		return fmt.Errorf("open zip %s: %w", filePath, err)
 	}
 	defer r.Close()
 
-	sem := make(chan struct{}, p.concurrency) // semaphore for concurrency
 	errCh := make(chan error, len(r.File))
 	var wg sync.WaitGroup
 
@@ -112,26 +113,27 @@ func (p *FileProcessServiceImpl) ProcessZipFile(filePath string) error {
 			continue
 		}
 
-		sem <- struct{}{}
+		p.sem <- struct{}{}
 		wg.Add(1)
 		go func(f *zip.File) {
 			defer wg.Done()
-			defer func() { <-sem }()
+			defer func() { <-p.sem }()
 
 			if err := p.ProcessZipEntry(f); err != nil {
-				errCh <- fmt.Errorf("entry %s: %w", f.Name, err)
-				log.Logger.Error("failed to process zip entry", zap.String("entry", f.Name), zap.Error(err))
+				select {
+				case errCh <- fmt.Errorf("entry %s: %w", f.Name, err):
+				default:
+					log.Logger.Warn("error channel full, skipping error")
+				}
 			}
 		}(f)
 	}
 
 	wg.Wait() // wait for all files to finish
 	close(errCh)
-	log.Logger.Info("finished processing nested zip")
 
 	// Flush any remaining batch
 	if err := p.flushBatch(); err != nil {
-		log.Logger.Error("final batch flush failed", zap.Error(err))
 		return err
 	}
 
@@ -150,7 +152,6 @@ func (p *FileProcessServiceImpl) ProcessZipFile(filePath string) error {
 func (p *FileProcessServiceImpl) ProcessZipEntry(f *zip.File) error {
 	rc, err := f.Open()
 	if err != nil {
-		log.Logger.Warn("failed to open zip entry", zap.String("entry", f.Name), zap.Error(err))
 		return err
 	}
 	defer rc.Close()
@@ -162,21 +163,21 @@ func (p *FileProcessServiceImpl) ProcessZipEntry(f *zip.File) error {
 	case strings.HasSuffix(name, ".csv") || strings.HasSuffix(name, ".mdff"):
 		return p.ProcessCSVStream(rc, f.Name)
 	default:
-		log.Logger.Info("skipping unsupported file", zap.String("entry", f.Name))
+		return nil
 	}
-	return nil
 }
 
 // processNestedZip writes nested zip to temp file and processes recursively
 func (p *FileProcessServiceImpl) ProcessNestedZip(rc io.Reader, name string) error {
 
 	tmpFile, err := os.CreateTemp("", "nested-*.zip")
-	log.Logger.Info("ProcessNestedZip", zap.String("zipPath", name), zap.String("tempPath", tmpFile.Name()))
 	if err != nil {
 		return err
 	}
-	defer os.Remove(tmpFile.Name())
-	defer tmpFile.Close()
+	defer func() {
+		tmpFile.Close()
+		os.Remove(tmpFile.Name())
+	}()
 
 	if _, err := io.Copy(tmpFile, rc); err != nil {
 		return err
@@ -186,24 +187,14 @@ func (p *FileProcessServiceImpl) ProcessNestedZip(rc io.Reader, name string) err
 }
 
 func (p *FileProcessServiceImpl) ProcessCsvFile(filePath string) error {
-	log.Logger.Info("Processing csv file", zap.String("csvPath", filePath))
-
 	// Open CSV file directly
 	f, err := os.Open(filePath)
 	if err != nil {
-		log.Logger.Error("failed to open CSV", zap.String("filePath", filePath), zap.Error(err))
 		return fmt.Errorf("open csv %s: %w", filePath, err)
 	}
 	defer f.Close()
 
 	if err := p.ProcessCSVStream(f, filePath); err != nil {
-		log.Logger.Error("failed to process CSV", zap.String("filePath", filePath), zap.Error(err))
-		return err
-	}
-
-	// Flush any remaining batch
-	if err := p.flushBatch(); err != nil {
-		log.Logger.Error("final batch flush failed", zap.Error(err))
 		return err
 	}
 
@@ -229,10 +220,9 @@ func (p *FileProcessServiceImpl) ProcessCSVStream(r io.Reader, sourceName string
 		fields, err := csvr.Read()
 		if err != nil {
 			if errors.Is(err, io.EOF) {
-				log.Logger.Info("CSV EOF reached", zap.String("source", sourceName), zap.Int("records", recordCount))
 				return p.flushBatch()
 			}
-			log.Logger.Error("CSV read error", zap.String("source", sourceName), zap.Int("record", recordCount), zap.Error(err))
+			log.Logger.Error("csv read error", zap.Error(err))
 			return fmt.Errorf("csv read: %w", err)
 		}
 
@@ -240,6 +230,9 @@ func (p *FileProcessServiceImpl) ProcessCSVStream(r io.Reader, sourceName string
 			continue
 		}
 		recordCount++
+		if recordCount%p.opts.ProgressInterval == 0 {
+			log.Logger.Info("CSV processing progress", zap.String("source", sourceName), zap.Int("records", recordCount))
+		}
 		recordIndicator := strings.TrimSpace(fields[0])
 
 		switch recordIndicator {
@@ -251,17 +244,19 @@ func (p *FileProcessServiceImpl) ProcessCSVStream(r io.Reader, sourceName string
 			} else {
 				currentNMI = ""
 				currentInterval = 0
+				log.Logger.Warn("invalid 200 record", zap.Int("line", recordCount), zap.Strings("fields", fields))
 			}
 		case "300":
 			if currentNMI == "" || currentInterval == 0 {
-				log.Logger.Warn("300 without valid 200 context", zap.String("source", sourceName), zap.Int("record", recordCount))
 				continue
 			}
 			if err := p.handle300(fields, currentNMI, currentInterval, sourceName, recordCount); err != nil {
+				log.Logger.Error("failed to handle 300 record", zap.Int("line", recordCount), zap.Error(err))
 				return err
 			}
 		case "900":
 			if err := p.flushBatch(); err != nil {
+				log.Logger.Error("flush batch failed at 900 record", zap.Error(err))
 				return err
 			}
 			return nil
@@ -274,7 +269,6 @@ func (p *FileProcessServiceImpl) ProcessCSVStream(r io.Reader, sourceName string
 // handle200 parses a 200 record
 func (p *FileProcessServiceImpl) handle200(fields []string, source string, record int) (string, int, bool) {
 	if len(fields) <= 8 {
-		log.Logger.Warn("malformed 200 record", zap.String("source", source), zap.Int("record", record))
 		return "", 0, false
 	}
 	nmi := strings.TrimSpace(fields[1])
@@ -303,12 +297,9 @@ func (p *FileProcessServiceImpl) handle300(fields []string, currentNMI string, c
 
 	intervalsPerDay := 1440 / currentInterval
 	availableValues := len(fields) - 2
-	numValues := intervalsPerDay
-	if availableValues < intervalsPerDay {
-		numValues = availableValues
-	}
+	numValues := min(availableValues, intervalsPerDay)
 
-	for i := 0; i < numValues; i++ {
+	for i := range numValues {
 		if err := p.checkContextCancelled(); err != nil {
 			return err
 		}
@@ -345,19 +336,20 @@ func (p *FileProcessServiceImpl) ParseIntervalDates(s string) (time.Time, error)
 	for _, f := range formats {
 		t, err = time.ParseInLocation(f, s, time.UTC)
 		if err == nil {
-			return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC), nil
+			return t, nil
 		}
 	}
-	return t, err
+	return time.Time{}, err
 }
 
 // addToBatch appends row to batch safely and flushes if batch size reached
 func (p *FileProcessServiceImpl) addToBatch(row entity.MeterReadingsEntity) {
 	p.batchMutex.Lock()
-	defer p.batchMutex.Unlock()
-
 	p.batch = append(p.batch, row)
-	if len(p.batch) >= p.opts.BatchSize {
+	flushNeeded := len(p.batch) >= p.opts.BatchSize
+	p.batchMutex.Unlock()
+
+	if flushNeeded {
 		if err := p.flushBatch(); err != nil {
 			log.Logger.Error("flush batch failed", zap.Error(err))
 		}
@@ -366,27 +358,32 @@ func (p *FileProcessServiceImpl) addToBatch(row entity.MeterReadingsEntity) {
 
 // flushBatch inserts batch into DB safely
 func (p *FileProcessServiceImpl) flushBatch() error {
-	_db := mysql.GetDB()
 	p.batchMutex.Lock()
-	defer p.batchMutex.Unlock()
-
 	if len(p.batch) == 0 {
+		p.batchMutex.Unlock()
 		return nil
 	}
 
-	batchSize := p.opts.BatchSize
-	if batchSize <= 0 {
-		batchSize = 500
-	}
+	batchCopy := make([]entity.MeterReadingsEntity, len(p.batch))
+	copy(batchCopy, p.batch)
+	p.batch = p.batch[:0]
+	p.batchMutex.Unlock()
 
-	if err := _db.Clauses(clause.OnConflict{
+	ctx, cancel := context.WithTimeout(p.ctx, p.opts.InsertTimeout)
+	defer cancel()
+
+	_db := mysql.GetDB().WithContext(ctx)
+
+	// Insert batch with conflict handling
+	err := _db.Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "nmi"}, {Name: "timestamp"}},             // conflict keys
 		DoUpdates: clause.AssignmentColumns([]string{"consumption", "updated_at"}), // columns to update
-	}).CreateInBatches(p.batch, batchSize).Error; err != nil {
+	}).CreateInBatches(batchCopy, p.opts.BatchSize).Error
+
+	if err != nil {
 		log.Logger.Error("failed to insert batch", zap.Error(err))
 		return err
 	}
 
-	p.batch = p.batch[:0]
 	return nil
 }

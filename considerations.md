@@ -24,3 +24,18 @@ if fail, keep file
 maintain logs as well
 
 further implementations can be retry mechanism and raising of issue
+
+job queues can utilise redis or RabbitMQ instead of in-mem queye that was implemented > but not required to do so > maybe will move to redis
+
+can setup monitoring for the queues and retry and server health with grafana
+
+Availability as well, if server stops, what about the current queue and the impending data ingestion?
+
+files that failed, keep, if success, delete
+retry mechanism
+rate limiting / throttling
+backpressure
+set concurrency etc to config.toml
+persistent queue - consider redis, reabbitmq, kafka
+mertrics and observability
+validation of data and rules for 100/200/300/400/500/900/250/550

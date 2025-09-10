@@ -4,6 +4,8 @@ import (
 	"flo/assessment/config/cronjob"
 	"flo/assessment/config/log"
 	"flo/assessment/config/worker"
+	"flo/assessment/src/tools"
+	"fmt"
 	"path/filepath"
 	"time"
 
@@ -13,24 +15,32 @@ import (
 type CronJobImpl struct {
 }
 
-func CreateBaseCronJob() {
+func MockDataIngestion() {
+	// mimic data ingestion pipeline, frequent and big file size
 	_cron := cronjob.GetCJ()
-	zipPaths := []string{"./nem12_data.zip", "./nem12_data.csv"}
-	// zipPaths := []string{"./nem12_data.zip"}
 
-	_cron.AddFunc("@every 1m", func() {
-		log.Logger.Info("Cron job triggered", zap.Time("timestamp", time.Now().UTC()))
+	_cron.AddFunc("@every 10s", func() {
+		log.Logger.Info("CSV data ingestion triggered", zap.Time("timestamp", time.Now().UTC()))
 
-		for _, zipPath := range zipPaths {
-			absPath, _ := filepath.Abs(zipPath)
+		// Generate unique filenames with UUID
+		uuidStr := tools.NewUuid()
+		files := []struct {
+			interval int
+			name     string
+		}{
+			{5, fmt.Sprintf("nem12_5min_%s.csv", uuidStr)},
+			{15, fmt.Sprintf("nem12_15min_%s.csv", uuidStr)},
+			{30, fmt.Sprintf("nem12_30min_%s.csv", uuidStr)},
+		}
+
+		for _, f := range files {
+			if err := tools.GenerateNEM12CSV(f.name, f.interval, 3, 5); err != nil {
+				log.Logger.Error("Failed to generate CSV", zap.String("file", f.name), zap.Error(err))
+				continue
+			}
+
+			absPath, _ := filepath.Abs(f.name)
 			worker.EnqueueFile(absPath) // enqueue to worker pool
 		}
 	})
-}
-
-func MockDataIngestion() {
-	// mimic data ingestion pipeline, frequent and big file size
-
-	//
-
 }

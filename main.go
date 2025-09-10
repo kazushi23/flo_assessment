@@ -39,7 +39,7 @@ func main() {
 				log.Logger.Error("Recovered panic in cron job", zap.Any("panic", r))
 			}
 		}()
-		cron.CreateBaseCronJob()
+		cron.MockDataIngestion()
 	})
 
 	r := gin.Default()
