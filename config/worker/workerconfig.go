@@ -59,7 +59,7 @@ func worker(id, concurrencyPerFile int) {
 		opts.BatchSize = 1000
 
 		serviceImpl := service.NewFileProcessServiceImpl(ctx, concurrencyPerFile, opts)
-		processErr := serviceImpl.ProcessZipFile(job.Path)
+		processErr := serviceImpl.ProcessFileEntry(job.Path)
 		cancel()
 
 		// Update job record on completion

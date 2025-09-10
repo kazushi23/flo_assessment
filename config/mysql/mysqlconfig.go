@@ -51,6 +51,7 @@ func init() {
 	sqlDB, _ := _db.DB() // initialise a DB object
 	if err := _db.AutoMigrate(
 		&entity.MeterReadingsEntity{},
+		&entity.JobQueueEntity{},
 	); err != nil {
 		fmt.Println("Migration failed:", err)
 	}

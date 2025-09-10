@@ -74,67 +74,82 @@ func (p *FileProcessServiceImpl) checkContextCancelled() error {
 		return nil
 	}
 }
+func (p *FileProcessServiceImpl) ProcessFileEntry(filePath string) error {
+	log.Logger.Info("Entry to process zip file", zap.String("zipPath", filePath))
+
+	lowerPath := strings.ToLower(filePath)
+	ext := filepath.Ext(lowerPath)
+
+	switch ext {
+	case ".zip":
+		return p.ProcessZipFile(filePath)
+	case ".csv":
+		return p.ProcessCsvFile(filePath)
+	default:
+		log.Logger.Error("wrong file type, only csv and zip allowed", zap.String("zipPath", filePath))
+		return fmt.Errorf("wrong file type, only csv and zip allowed")
+	}
+}
 
 // ProcessZipFile reads a zip and processes all entries concurrently
 func (p *FileProcessServiceImpl) ProcessZipFile(filePath string) error {
 	log.Logger.Info("Processing zip file", zap.String("zipPath", filePath))
 
-	lowerPath := strings.ToLower(filePath)
-	ext := filepath.Ext(lowerPath)
-	if ext == ".zip" {
-		r, err := zip.OpenReader(filePath)
-		if err != nil {
-			log.Logger.Error("failed to open zip", zap.String("zipPath", filePath), zap.Error(err))
-			return fmt.Errorf("open zip %s: %w", filePath, err)
+	r, err := zip.OpenReader(filePath)
+	if err != nil {
+		log.Logger.Error("failed to open zip", zap.String("zipPath", filePath), zap.Error(err))
+		return fmt.Errorf("open zip %s: %w", filePath, err)
+	}
+	defer r.Close()
+
+	sem := make(chan struct{}, p.concurrency) // semaphore for concurrency
+
+	for _, f := range r.File {
+		if p.checkContextCancelled() != nil {
+			return p.ctx.Err()
 		}
-		defer r.Close()
 
-		sem := make(chan struct{}, p.concurrency) // semaphore for concurrency
+		if f.FileInfo().IsDir() {
+			continue
+		}
 
-		for _, f := range r.File {
-			if p.checkContextCancelled() != nil {
-				return p.ctx.Err()
+		sem <- struct{}{}
+		p.wg.Add(1)
+		go func(f *zip.File) {
+			defer p.wg.Done()
+			defer func() { <-sem }()
+
+			if err := p.ProcessZipEntry(f); err != nil {
+				log.Logger.Error("failed to process zip entry", zap.String("entry", f.Name), zap.Error(err))
 			}
+		}(f)
+	}
 
-			if f.FileInfo().IsDir() {
-				continue
-			}
+	p.wg.Wait() // wait for all files to finish
 
-			sem <- struct{}{}
-			p.wg.Add(1)
-			go func(f *zip.File) {
-				defer p.wg.Done()
-				defer func() { <-sem }()
+	// Flush any remaining batch
+	if err := p.flushBatch(); err != nil {
+		log.Logger.Error("final batch flush failed", zap.Error(err))
+		return err
+	}
 
-				if err := p.ProcessZipEntry(f); err != nil {
-					log.Logger.Error("failed to process zip entry", zap.String("entry", f.Name), zap.Error(err))
-				}
-			}(f)
-		}
+	return nil
+}
 
-		p.wg.Wait() // wait for all files to finish
+func (p *FileProcessServiceImpl) ProcessCsvFile(filePath string) error {
+	log.Logger.Info("Processing zip file", zap.String("zipPath", filePath))
 
-		// Flush any remaining batch
-		if err := p.flushBatch(); err != nil {
-			log.Logger.Error("final batch flush failed", zap.Error(err))
-			return err
-		}
-	} else if ext == ".csv" {
-		// Open CSV file directly
-		f, err := os.Open(filePath)
-		if err != nil {
-			log.Logger.Error("failed to open CSV", zap.String("filePath", filePath), zap.Error(err))
-			return fmt.Errorf("open csv %s: %w", filePath, err)
-		}
-		defer f.Close()
+	// Open CSV file directly
+	f, err := os.Open(filePath)
+	if err != nil {
+		log.Logger.Error("failed to open CSV", zap.String("filePath", filePath), zap.Error(err))
+		return fmt.Errorf("open csv %s: %w", filePath, err)
+	}
+	defer f.Close()
 
-		if err := p.ProcessCSVStream(f, filePath); err != nil {
-			log.Logger.Error("failed to process CSV", zap.String("filePath", filePath), zap.Error(err))
-			return err
-		}
-	} else {
-		log.Logger.Warn("unsupported file type, skipping", zap.String("filePath", filePath), zap.String("extension", ext))
-		return nil
+	if err := p.ProcessCSVStream(f, filePath); err != nil {
+		log.Logger.Error("failed to process CSV", zap.String("filePath", filePath), zap.Error(err))
+		return err
 	}
 
 	// Flush any remaining batch
