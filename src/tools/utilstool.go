@@ -37,7 +37,7 @@ func GenerateNEM12CSV(fileName string, intervalMinutes int, numDays int, numRegi
 
 		for reg := 1; reg <= numRegisters; reg++ {
 			registerID := fmt.Sprintf("E%d", reg)
-			nmi := fmt.Sprintf("%s%02d", nmiBase, reg)
+			nmi := fmt.Sprintf("%s%02d", nmiBase, reg%100)
 
 			// 200 - NMI + Register
 			w.Write([]string{
