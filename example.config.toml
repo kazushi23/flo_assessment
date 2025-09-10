@@ -1,0 +1,12 @@
+appName = "flo_assessment"
+
+[mysql]
+host = "127.0.0.1"
+user = "user"
+password = "password"
+dbName = "db_name"
+port = 3306
+
+[redis]
+urls = "127.0.0.1:6379"
+password = "password"
