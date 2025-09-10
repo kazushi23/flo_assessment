@@ -16,6 +16,7 @@ type CronJobImpl struct {
 func CreateBaseCronJob() {
 	_cron := cronjob.GetCJ()
 	zipPaths := []string{"./nem12_data.zip", "./nem12_data.csv"}
+	// zipPaths := []string{"./nem12_data.zip"}
 
 	_cron.AddFunc("@every 1m", func() {
 		log.Logger.Info("Cron job triggered", zap.Time("timestamp", time.Now().UTC()))

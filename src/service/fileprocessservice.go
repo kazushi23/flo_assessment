@@ -48,7 +48,6 @@ type FileProcessServiceImpl struct {
 	opts        *ProcessorOptions
 	batch       []entity.MeterReadingsEntity
 	batchMutex  sync.Mutex
-	wg          sync.WaitGroup
 	concurrency int
 }
 
@@ -93,8 +92,6 @@ func (p *FileProcessServiceImpl) ProcessFileEntry(filePath string) error {
 
 // ProcessZipFile reads a zip and processes all entries concurrently
 func (p *FileProcessServiceImpl) ProcessZipFile(filePath string) error {
-	log.Logger.Info("Processing zip file", zap.String("zipPath", filePath))
-
 	r, err := zip.OpenReader(filePath)
 	if err != nil {
 		log.Logger.Error("failed to open zip", zap.String("zipPath", filePath), zap.Error(err))
@@ -103,6 +100,8 @@ func (p *FileProcessServiceImpl) ProcessZipFile(filePath string) error {
 	defer r.Close()
 
 	sem := make(chan struct{}, p.concurrency) // semaphore for concurrency
+	errCh := make(chan error, len(r.File))
+	var wg sync.WaitGroup
 
 	for _, f := range r.File {
 		if p.checkContextCancelled() != nil {
@@ -114,18 +113,21 @@ func (p *FileProcessServiceImpl) ProcessZipFile(filePath string) error {
 		}
 
 		sem <- struct{}{}
-		p.wg.Add(1)
+		wg.Add(1)
 		go func(f *zip.File) {
-			defer p.wg.Done()
+			defer wg.Done()
 			defer func() { <-sem }()
 
 			if err := p.ProcessZipEntry(f); err != nil {
+				errCh <- fmt.Errorf("entry %s: %w", f.Name, err)
 				log.Logger.Error("failed to process zip entry", zap.String("entry", f.Name), zap.Error(err))
 			}
 		}(f)
 	}
 
-	p.wg.Wait() // wait for all files to finish
+	wg.Wait() // wait for all files to finish
+	close(errCh)
+	log.Logger.Info("finished processing nested zip")
 
 	// Flush any remaining batch
 	if err := p.flushBatch(); err != nil {
@@ -133,11 +135,58 @@ func (p *FileProcessServiceImpl) ProcessZipFile(filePath string) error {
 		return err
 	}
 
+	if len(errCh) > 0 {
+		var allErrs []string
+		for e := range errCh {
+			allErrs = append(allErrs, e.Error())
+		}
+		return fmt.Errorf("zip processing completed with errors: %s", strings.Join(allErrs, "; "))
+	}
+
 	return nil
 }
 
+// ProcessZipEntry handles a single file entry in the zip
+func (p *FileProcessServiceImpl) ProcessZipEntry(f *zip.File) error {
+	rc, err := f.Open()
+	if err != nil {
+		log.Logger.Warn("failed to open zip entry", zap.String("entry", f.Name), zap.Error(err))
+		return err
+	}
+	defer rc.Close()
+
+	name := strings.ToLower(f.Name)
+	switch {
+	case strings.HasSuffix(name, ".zip"):
+		return p.ProcessNestedZip(rc, name)
+	case strings.HasSuffix(name, ".csv") || strings.HasSuffix(name, ".mdff"):
+		return p.ProcessCSVStream(rc, f.Name)
+	default:
+		log.Logger.Info("skipping unsupported file", zap.String("entry", f.Name))
+	}
+	return nil
+}
+
+// processNestedZip writes nested zip to temp file and processes recursively
+func (p *FileProcessServiceImpl) ProcessNestedZip(rc io.Reader, name string) error {
+
+	tmpFile, err := os.CreateTemp("", "nested-*.zip")
+	log.Logger.Info("ProcessNestedZip", zap.String("zipPath", name), zap.String("tempPath", tmpFile.Name()))
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmpFile.Name())
+	defer tmpFile.Close()
+
+	if _, err := io.Copy(tmpFile, rc); err != nil {
+		return err
+	}
+
+	return p.ProcessZipFile(tmpFile.Name())
+}
+
 func (p *FileProcessServiceImpl) ProcessCsvFile(filePath string) error {
-	log.Logger.Info("Processing zip file", zap.String("zipPath", filePath))
+	log.Logger.Info("Processing csv file", zap.String("csvPath", filePath))
 
 	// Open CSV file directly
 	f, err := os.Open(filePath)
@@ -159,43 +208,6 @@ func (p *FileProcessServiceImpl) ProcessCsvFile(filePath string) error {
 	}
 
 	return nil
-}
-
-// ProcessZipEntry handles a single file entry in the zip
-func (p *FileProcessServiceImpl) ProcessZipEntry(f *zip.File) error {
-	rc, err := f.Open()
-	if err != nil {
-		log.Logger.Warn("failed to open zip entry", zap.String("entry", f.Name), zap.Error(err))
-		return err
-	}
-	defer rc.Close()
-
-	name := strings.ToLower(f.Name)
-	switch {
-	case strings.HasSuffix(name, ".zip"):
-		return p.ProcessNestedZip(rc, name)
-	case strings.HasSuffix(name, ".csv"):
-		return p.ProcessCSVStream(rc, f.Name)
-	default:
-		log.Logger.Info("skipping unsupported file", zap.String("entry", f.Name))
-	}
-	return nil
-}
-
-// processNestedZip writes nested zip to temp file and processes recursively
-func (p *FileProcessServiceImpl) ProcessNestedZip(rc io.Reader, name string) error {
-	tmpFile, err := os.CreateTemp("", "nested-*.zip")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmpFile.Name())
-	defer tmpFile.Close()
-
-	if _, err := io.Copy(tmpFile, rc); err != nil {
-		return err
-	}
-
-	return p.ProcessZipFile(tmpFile.Name())
 }
 
 // processCSVStream reads CSV and processes data in batches

@@ -22,7 +22,7 @@ var jobQueue chan QueueFileJob
 func StartWorkerPool(numWorkers, queueSize, concurrencyPerFile int) {
 	jobQueue = make(chan QueueFileJob, queueSize)
 
-	for i := 0; i < numWorkers; i++ {
+	for i := range numWorkers {
 		go worker(i, concurrencyPerFile)
 	}
 
@@ -61,7 +61,6 @@ func worker(id, concurrencyPerFile int) {
 		serviceImpl := service.NewFileProcessServiceImpl(ctx, concurrencyPerFile, opts)
 		processErr := serviceImpl.ProcessFileEntry(job.Path)
 		cancel()
-
 		// Update job record on completion
 		service.IJobQueueService.HandleEndQueue(jobRecord, processErr, job.Path, db)
 	}
