@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -75,40 +76,66 @@ func (p *FileProcessServiceImpl) checkContextCancelled() error {
 }
 
 // ProcessZipFile reads a zip and processes all entries concurrently
-func (p *FileProcessServiceImpl) ProcessZipFile(zipPath string) error {
-	log.Logger.Info("Processing zip file", zap.String("zipPath", zipPath))
+func (p *FileProcessServiceImpl) ProcessZipFile(filePath string) error {
+	log.Logger.Info("Processing zip file", zap.String("zipPath", filePath))
 
-	r, err := zip.OpenReader(zipPath)
-	if err != nil {
-		log.Logger.Error("failed to open zip", zap.String("zipPath", zipPath), zap.Error(err))
-		return fmt.Errorf("open zip %s: %w", zipPath, err)
-	}
-	defer r.Close()
-
-	sem := make(chan struct{}, p.concurrency) // semaphore for concurrency
-
-	for _, f := range r.File {
-		if p.checkContextCancelled() != nil {
-			return p.ctx.Err()
+	lowerPath := strings.ToLower(filePath)
+	ext := filepath.Ext(lowerPath)
+	if ext == ".zip" {
+		r, err := zip.OpenReader(filePath)
+		if err != nil {
+			log.Logger.Error("failed to open zip", zap.String("zipPath", filePath), zap.Error(err))
+			return fmt.Errorf("open zip %s: %w", filePath, err)
 		}
+		defer r.Close()
 
-		if f.FileInfo().IsDir() {
-			continue
-		}
+		sem := make(chan struct{}, p.concurrency) // semaphore for concurrency
 
-		sem <- struct{}{}
-		p.wg.Add(1)
-		go func(f *zip.File) {
-			defer p.wg.Done()
-			defer func() { <-sem }()
-
-			if err := p.ProcessZipEntry(f); err != nil {
-				log.Logger.Error("failed to process zip entry", zap.String("entry", f.Name), zap.Error(err))
+		for _, f := range r.File {
+			if p.checkContextCancelled() != nil {
+				return p.ctx.Err()
 			}
-		}(f)
-	}
 
-	p.wg.Wait() // wait for all files to finish
+			if f.FileInfo().IsDir() {
+				continue
+			}
+
+			sem <- struct{}{}
+			p.wg.Add(1)
+			go func(f *zip.File) {
+				defer p.wg.Done()
+				defer func() { <-sem }()
+
+				if err := p.ProcessZipEntry(f); err != nil {
+					log.Logger.Error("failed to process zip entry", zap.String("entry", f.Name), zap.Error(err))
+				}
+			}(f)
+		}
+
+		p.wg.Wait() // wait for all files to finish
+
+		// Flush any remaining batch
+		if err := p.flushBatch(); err != nil {
+			log.Logger.Error("final batch flush failed", zap.Error(err))
+			return err
+		}
+	} else if ext == ".csv" {
+		// Open CSV file directly
+		f, err := os.Open(filePath)
+		if err != nil {
+			log.Logger.Error("failed to open CSV", zap.String("filePath", filePath), zap.Error(err))
+			return fmt.Errorf("open csv %s: %w", filePath, err)
+		}
+		defer f.Close()
+
+		if err := p.ProcessCSVStream(f, filePath); err != nil {
+			log.Logger.Error("failed to process CSV", zap.String("filePath", filePath), zap.Error(err))
+			return err
+		}
+	} else {
+		log.Logger.Warn("unsupported file type, skipping", zap.String("filePath", filePath), zap.String("extension", ext))
+		return nil
+	}
 
 	// Flush any remaining batch
 	if err := p.flushBatch(); err != nil {
@@ -131,9 +158,9 @@ func (p *FileProcessServiceImpl) ProcessZipEntry(f *zip.File) error {
 	name := strings.ToLower(f.Name)
 	switch {
 	case strings.HasSuffix(name, ".zip"):
-		return p.processNestedZip(rc, name)
+		return p.ProcessNestedZip(rc, name)
 	case strings.HasSuffix(name, ".csv"):
-		return p.processCSVStream(rc, f.Name)
+		return p.ProcessCSVStream(rc, f.Name)
 	default:
 		log.Logger.Info("skipping unsupported file", zap.String("entry", f.Name))
 	}
@@ -141,7 +168,7 @@ func (p *FileProcessServiceImpl) ProcessZipEntry(f *zip.File) error {
 }
 
 // processNestedZip writes nested zip to temp file and processes recursively
-func (p *FileProcessServiceImpl) processNestedZip(rc io.Reader, name string) error {
+func (p *FileProcessServiceImpl) ProcessNestedZip(rc io.Reader, name string) error {
 	tmpFile, err := os.CreateTemp("", "nested-*.zip")
 	if err != nil {
 		return err
@@ -157,7 +184,7 @@ func (p *FileProcessServiceImpl) processNestedZip(rc io.Reader, name string) err
 }
 
 // processCSVStream reads CSV and processes data in batches
-func (p *FileProcessServiceImpl) processCSVStream(r io.Reader, sourceName string) error {
+func (p *FileProcessServiceImpl) ProcessCSVStream(r io.Reader, sourceName string) error {
 	csvr := csv.NewReader(bufio.NewReader(r))
 	csvr.TrimLeadingSpace = true
 	csvr.LazyQuotes = true
@@ -326,8 +353,8 @@ func (p *FileProcessServiceImpl) flushBatch() error {
 	}
 
 	if err := _db.Clauses(clause.OnConflict{
-		Columns:   []clause.Column{{Name: "nmi"}, {Name: "timestamp"}}, // conflict keys
-		DoUpdates: clause.AssignmentColumns([]string{"consumption"}),   // columns to update
+		Columns:   []clause.Column{{Name: "nmi"}, {Name: "timestamp"}},             // conflict keys
+		DoUpdates: clause.AssignmentColumns([]string{"consumption", "updated_at"}), // columns to update
 	}).CreateInBatches(p.batch, batchSize).Error; err != nil {
 		log.Logger.Error("failed to insert batch", zap.Error(err))
 		return err
