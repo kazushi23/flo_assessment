@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+	"gorm.io/gorm/clause"
 )
 
 // ProcessorOptions defines options for CSV processing and batching
@@ -324,7 +325,10 @@ func (p *FileProcessServiceImpl) flushBatch() error {
 		batchSize = 500
 	}
 
-	if err := _db.CreateInBatches(p.batch, batchSize).Error; err != nil {
+	if err := _db.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "nmi"}, {Name: "timestamp"}}, // conflict keys
+		DoUpdates: clause.AssignmentColumns([]string{"consumption"}),   // columns to update
+	}).CreateInBatches(p.batch, batchSize).Error; err != nil {
 		log.Logger.Error("failed to insert batch", zap.Error(err))
 		return err
 	}
