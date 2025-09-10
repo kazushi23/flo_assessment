@@ -1,0 +1,48 @@
+# Binaries
+/bin/
+/build/
+/out/
+/*.exe
+/*.exe~
+/*.dll
+/*.so
+/*.dylib
+
+# Test binaries
+*.test
+
+# Go modules
+/go.sum
+/go.mod
+
+# Vendor directory (optional, if using modules)
+vendor/
+
+# IDE/editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*.DS_Store
+
+# Logs
+*.log
+logs/
+*.out
+
+# OS generated files
+Thumbs.db
+*.tmp
+*.temp
+
+# Coverage files
+coverage.out
+*.coverprofile
+
+# Environment files
+config.toml
+
+# Other temp files
+*.bak
+*.old
+*.orig
