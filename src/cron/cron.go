@@ -34,7 +34,12 @@ func MockDataIngestion() {
 		}
 
 		for _, f := range files {
-			if err := tools.GenerateNEM12CSV(f.name, f.interval, 100, 100); err != nil {
+			// if err := tools.GenerateNEM12CSV(f.name, f.interval, 100, 100); err != nil {
+			// 	log.Logger.Error("Failed to generate CSV", zap.String("file", f.name), zap.Error(err))
+			// 	continue
+			// }
+
+			if err := tools.GenerateMalformNEM12CSV(f.name, f.interval, 5, 5); err != nil {
 				log.Logger.Error("Failed to generate CSV", zap.String("file", f.name), zap.Error(err))
 				continue
 			}

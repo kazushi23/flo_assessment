@@ -70,62 +70,64 @@ func (p *CsvProcessServiceImpl) ProcessCSVStream(r io.Reader, sourceName string,
 
 		switch recordIndicator {
 		case "200":
-			nmi, interval, ok := p.handle200(fields, sourceName, recordCount)
-			if ok {
-				currentNMI = nmi
-				currentInterval = interval
-			} else {
-				currentNMI = ""
-				currentInterval = 0
-				log.Logger.Warn("invalid 200 record", zap.Int("line", recordCount), zap.Strings("fields", fields))
-			}
+			nmi, interval := p.handle200(fields, sourceName, recordCount, fps)
+			currentNMI = nmi
+			currentInterval = interval
 		case "300":
-			if currentNMI == "" || currentInterval == 0 {
-				continue
-			}
-			if err := p.handle300(fields, currentNMI, currentInterval, sourceName, recordCount, fps); err != nil {
-				log.Logger.Error("failed to handle 300 record", zap.Int("line", recordCount), zap.Error(err))
-				return err
+			if currentNMI != "" || currentInterval != 0 {
+				p.handle300(fields, currentNMI, currentInterval, sourceName, recordCount, fps)
 			}
 		case "900":
-			if err := fps.flushBatch(); err != nil {
-				log.Logger.Error("flush batch failed at 900 record", zap.Error(err))
-				return err
-			}
+			fps.flushBatch()
 			return nil
 		default:
-			// ignore unknown records
+			log.Logger.Warn("ignored record type", zap.Int("line", recordCount), zap.Strings("fields", fields))
+			fps.addErrorRowCSV(fields, fmt.Errorf("ignored record type: %s", recordIndicator))
 		}
 	}
+
 }
 
 // handle200 parses a 200 record
-func (p *CsvProcessServiceImpl) handle200(fields []string, source string, record int) (string, int, bool) {
+func (p *CsvProcessServiceImpl) handle200(fields []string, source string, record int, fps *FileProcessServiceImpl) (string, int) {
 	if len(fields) <= 8 {
-		return "", 0, false
+		err := fmt.Errorf("not enough fields in 200 record")
+		log.Logger.Warn("malformed 200 record", zap.Int("line", record), zap.Strings("fields", fields), zap.Error(err))
+		fps.addErrorRowCSV(fields, err)
+		return "", 0
 	}
 	nmi := strings.TrimSpace(fields[1])
 	ivalStr := strings.TrimSpace(fields[8])
 	if ivalStr == "" {
-		return nmi, 0, false
+		err := fmt.Errorf("interval value empty")
+		log.Logger.Warn("malformed 200 record", zap.Int("line", record), zap.Strings("fields", fields), zap.Error(err))
+		fps.addErrorRowCSV(fields, err)
+		return nmi, 0
 	}
 	iv, err := strconv.Atoi(ivalStr)
 	if err != nil {
-		return nmi, 0, false
+		log.Logger.Warn("invalid interval value", zap.Int("line", record), zap.Strings("fields", fields), zap.Error(err))
+		fps.addErrorRowCSV(fields, err)
+		return nmi, 0
 	}
-	return nmi, iv, true
+	return nmi, iv
 }
 
 // handle300 parses 300 record and adds data to batch
-func (p *CsvProcessServiceImpl) handle300(fields []string, currentNMI string, currentInterval int, source string, record int, fps *FileProcessServiceImpl) error {
+func (p *CsvProcessServiceImpl) handle300(fields []string, currentNMI string, currentInterval int, source string, record int, fps *FileProcessServiceImpl) {
 	if len(fields) < 3 {
-		return nil
+		err := fmt.Errorf("not enough fields in 300 record")
+		log.Logger.Warn("malformed 300 record", zap.Int("line", record), zap.Strings("fields", fields), zap.Error(err))
+		fps.addErrorRowCSV(fields, err)
+		return
 	}
 
 	dateStr := strings.TrimSpace(fields[1])
 	intervalDate, err := p.ParseIntervalDates(dateStr)
 	if err != nil {
-		return nil
+		log.Logger.Warn("invalid date format in 300 record", zap.Int("line", record), zap.Strings("fields", fields), zap.Error(err))
+		fps.addErrorRowCSV(fields, err)
+		return
 	}
 
 	intervalsPerDay := 1440 / currentInterval
@@ -134,11 +136,15 @@ func (p *CsvProcessServiceImpl) handle300(fields []string, currentNMI string, cu
 
 	for i := range numValues {
 		if err := fps.checkContextCancelled(); err != nil {
-			return err
+			log.Logger.Warn("context cancelled during CSV processing", zap.Error(err))
+			return
 		}
 
 		raw := strings.TrimSpace(fields[2+i])
 		if raw == "" && !fps.opts.AllowEmptyReading {
+			err := fmt.Errorf("empty value not allowed at interval %d", i)
+			log.Logger.Warn("empty value in 300 record", zap.String("nmi", currentNMI), zap.Error(err))
+			fps.addErrorRowCSV(fields, err)
 			continue
 		} else if raw == "" {
 			raw = "0"
@@ -146,6 +152,8 @@ func (p *CsvProcessServiceImpl) handle300(fields []string, currentNMI string, cu
 
 		val, err := strconv.ParseFloat(strings.ReplaceAll(raw, ",", ""), 64)
 		if err != nil {
+			log.Logger.Warn("invalid consumption value", zap.String("nmi", currentNMI), zap.String("raw_value", raw), zap.Error(err))
+			fps.addErrorRowCSV(fields, err)
 			continue
 		}
 
@@ -157,8 +165,13 @@ func (p *CsvProcessServiceImpl) handle300(fields []string, currentNMI string, cu
 			Timestamp:   ts,
 			Consumption: val,
 		})
+
+		if len(fps.batch) >= fps.opts.BatchSize {
+			if err := fps.flushBatch(); err != nil {
+				log.Logger.Error("failed to flush batch mid-file", zap.Error(err))
+			}
+		}
 	}
-	return nil
 }
 
 // ParseIntervalDates parses multiple date formats

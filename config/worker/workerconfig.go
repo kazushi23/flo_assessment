@@ -58,8 +58,10 @@ func worker(id, concurrencyPerFile int) {
 		opts := service.DefaultProcessorOptions()
 		opts.BatchSize = 1000
 
-		serviceImpl := service.NewFileProcessServiceImpl(ctx, concurrencyPerFile, opts)
+		serviceImpl := service.NewFileProcessServiceImpl(ctx, concurrencyPerFile, opts, id, job.Path)
 		processErr := serviceImpl.ProcessFileEntry(job.Path)
+
+		serviceImpl.StoreAllErrors()
 		cancel()
 		// Update job record on completion
 		service.IJobQueueService.HandleEndQueue(jobRecord, processErr, job.Path, db)

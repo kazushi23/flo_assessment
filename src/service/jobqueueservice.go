@@ -66,4 +66,5 @@ func (j *JobQueueServiceImpl) HandleEndQueue(job entity.JobQueueEntity, err erro
 	if dbErr := db.Model(&job).Updates(updates).Error; dbErr != nil {
 		log.Logger.Error("Failed to update job completion status", zap.String("file", filePath), zap.Error(dbErr))
 	}
+
 }

@@ -52,6 +52,7 @@ func init() {
 	if err := _db.AutoMigrate(
 		&entity.MeterReadingsEntity{},
 		&entity.JobQueueEntity{},
+		&entity.ErrorRowsEntity{},
 	); err != nil {
 		fmt.Println("Migration failed:", err)
 	}

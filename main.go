@@ -43,6 +43,12 @@ func main() {
 	})
 
 	r := gin.Default()
+	r.GET("/health", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{
+			"status": "ok",
+			"time":   time.Now(),
+		})
+	})
 	s := &http.Server{
 		Addr:           ":8080",
 		Handler:        r,

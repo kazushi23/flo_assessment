@@ -39,3 +39,98 @@ set concurrency etc to config.toml
 persistent queue - consider redis, reabbitmq, kafka
 mertrics and observability
 validation of data and rules for 100/200/300/400/500/900/250/550
+remove file if no error
+dont fail entire insert if any rows have issue
+
+Critical Production Issues to Address
+1. Data Validation & NEM12 Format Compliance
+
+Missing NEM12 header validation: You're not validating the mandatory NEM12 header record (100 record type)
+No checksum validation: NEM12 files include checksums in 900 records that must be validated
+Missing mandatory field validation: Need to validate required fields like version number, creation date/time, from participant, to participant
+No file structure validation: Should validate the logical sequence of records (100 → 200 → 300 → 900)
+Quality flags handling: NEM12 includes quality and method flags for each reading that you're not processing
+Missing validation for NMI format: Should validate NMI checksums and format compliance
+
+2. Error Handling & Recovery
+
+No circuit breaker pattern: If database goes down, you'll overwhelm it with retries
+Missing dead letter queue: Failed jobs have no retry mechanism or manual intervention path
+No graceful shutdown: Workers don't handle shutdown signals properly
+Context cancellation not propagated: CSV processing doesn't fully respect context cancellation
+Memory leaks potential: Large files could cause OOM without proper streaming limits
+
+3. Monitoring & Observability
+
+No metrics collection: Need Prometheus/similar metrics for job processing rates, error rates, processing times
+No health checks: Application needs health endpoints for load balancers
+Insufficient structured logging: Missing request IDs, user context, processing stages
+No alerting: Need alerts for processing failures, queue buildup, database issues
+No distributed tracing: Can't track requests across services
+
+4. Security & Compliance
+
+No file size limits: Could be vulnerable to DoS attacks with massive files
+No virus scanning: Files should be scanned before processing
+Missing audit trails: Need to track who uploaded what and when
+No data encryption: Sensitive meter data should be encrypted at rest
+No access controls: Missing authentication/authorization for file uploads
+
+5. Performance & Scalability
+
+No connection pooling limits: Database connections not properly managed
+Missing backpressure handling: Can overwhelm downstream systems
+No caching strategy: Repeated NMI lookups could benefit from Redis cache
+Inefficient batch processing: Fixed batch sizes might not be optimal
+No horizontal scaling: Workers are tied to single instance
+
+6. Data Integrity & Consistency
+
+No transaction management: Partial failures could leave inconsistent state
+Missing data deduplication: Same file processed twice could create duplicates
+No data retention policies: Old data accumulation without cleanup
+Missing backup/restore procedures: No disaster recovery plan
+
+7. Configuration & Environment Management
+
+Hardcoded timeouts: Should be configurable per environment
+No feature flags: Can't disable features without code changes
+Missing environment-specific configs: Dev/staging/prod configurations not separated
+No secrets management: Database credentials should use proper secret management
+
+Immediate Actions for Today's Production Deployment
+High Priority (Must Fix Before Go-Live):
+
+Add file size validation and limits
+Implement proper NEM12 header validation
+Add database connection limits and timeouts
+Implement graceful shutdown handling
+Add basic health check endpoints
+Set up proper logging levels and structured logging
+Add Redis for job state persistence
+Implement basic retry logic with exponential backoff
+
+Medium Priority (Fix Within 24-48 Hours):
+
+Add comprehensive NEM12 validation
+Implement circuit breaker pattern
+Add metrics collection (Prometheus)
+Set up monitoring and alerting
+Implement file virus scanning
+Add audit logging
+
+Data Preprocessing Recommendations:
+
+Pre-validation service: Validate NEM12 format before queuing
+File sanitization: Check for malicious content
+Metadata extraction: Extract file info (date ranges, NMI count) before processing
+Duplicate detection: Check if file was already processed
+Data quality checks: Validate reading values are within expected ranges
+
+Redis Implementation for Job Management:
+
+Use Redis for job state tracking and distributed locking
+Implement job heartbeats to detect stuck workers
+Store processing progress for large files
+Implement job priority queues
+Add job expiration and cleanup
