@@ -67,6 +67,7 @@ func init() {
 		&entity.MeterReadingsEntity{},
 		&entity.JobQueueEntity{},
 		&entity.ErrorRowsEntity{},
+		&entity.NemFileEntity{},
 	); err != nil {
 		log.Fatal("Migration failed:", err)
 	}

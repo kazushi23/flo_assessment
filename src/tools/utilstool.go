@@ -48,7 +48,7 @@ func generateNEM12(fileName string, intervalMinutes, num200Records, max300Per200
 
 		// 200 record
 		w.Write([]string{"200", nmi, "E1E2", registerID, registerID, fmt.Sprintf("N%d", i+1),
-			"1002", "KWH", fmt.Sprintf("%d", intervalMinutes)})
+			"1002", "KWH", fmt.Sprintf("%d", intervalMinutes), startDate.Format("20060102")})
 
 		// multiple 300 interval rows with different dates
 		num300Rows := rand.Intn(max300Per200) + 1

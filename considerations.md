@@ -184,3 +184,61 @@ now i need alot of data validation
 if nmi-datetime clash, i need to know the previous nmi-datetime-100(filecreationdate) > compare with current 100 filecreationdate > if more than previous > do an update in db record > update the latest nmi-datetime-100(filecreationdate) > i can maintain nmi-datetime-100(filecreationdate) in redis as well
 
 current code will meet with deadlock as processing and write to db run concurrently. parallel write on the same records will deadlock as i generated multiple files of same nmi-datetime....this is an issue
+
+need data preprocessing to figure out if file is valid before we start processing and writing to db.
+im thinking if there is a flow issue, i need data validity vs speed 
+run parallel -> if data not valid there will be alot issues
+run sync -> do checking runtime -> very slow
+
+unless data ingestion pipeline:
+ingest data -> validate -> send all valid data to parallel run -> non valid can process and if go through -> run sync
+eg. if data repeated, send to another server to run sync update
+
+shifted a check on data ingestion, to validate the file and find existing nmi-timestamp. now it is found, but im not sure what to do with it in terms of industry standard.
+// not sure in real energy sector, what to do with it?
+// remove those repeated lines from csv and process it, then store repeat in another table as version history?
+// reject the file as it is malform? and inform the data provider?
+
+back to testing throttling
+if i had more time i will run test scripts, but alot of information gap at the moment, so im testing as though in production environment with mock data ingestion pipeline.
+
+havent test proper validation as i need some mock datasets. my datasets are all generated and idk what are the norms in terms of malform data
+
+if i run all 3, 5 mins interval will cause alot of backpressure in the queue
+{5, fmt.Sprintf("nem12_5min_%s.csv", uuidStr)},
+{15, fmt.Sprintf("nem12_15min_%s.csv", uuidStr)},
+{30, fmt.Sprintf("nem12_30min_%s.csv", uuidStr)},
+tools.GenerateNEM12Normal(f.name, f.interval, 50, 50); 
+
+if its just 15 and 30, no issue. further optimisation can be done
+
+write up on why i choose this combination
+[process]
+concurrency = 5
+jobqueuesize = 50
+numworkers = 5
+maxdbconnections = 100
+maxdbidleconnections = 50
+batchsize = 2000
+
+should i index nem-timestamp?
+
+when NMIIntervalExists:
+i can keep a record in redis nem-timestamp-filecreationdate
+remove row from csv
+run sync on that one row
+    check if previous nem-timestamp-{filecreationdate} older or newer
+        if older
+            update
+send the file to run async
+
+NONO new thinking. check nmi-timestamp [300] + intervaltime [200]
+if this 300 record with nmi-timestamp appear before and intervaltime of 200 as well
+entire row is going to be duplicate
+remove the row from csv and process sync (check the filecreationdatetime)
+
+have not done processrow and in handle 300, i need to create a record in newfileentity. dont want to commit to this yet, as i have a gut feel that this logic to handle 'duplicate' data might be flawed. need more understanding into nem files.
+
+so currently cant run when nmi and timestamp collides, there will be deadlock.
+
+no idea is flawed if a 300 record of time x has 5 min interval, it will still cross datetime with another 300 record of timex 30min interval....

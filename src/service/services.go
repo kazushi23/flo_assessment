@@ -5,4 +5,5 @@ var (
 	IFileProcessService = &FileProcessServiceImpl{}
 	ICsvProcessService  = &CsvProcessServiceImpl{}
 	IJobQueueService    = &JobQueueServiceImpl{}
+	IFileCheckerService = &FileCheckerServiceImpl{}
 )
