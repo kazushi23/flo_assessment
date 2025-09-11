@@ -179,3 +179,8 @@ numworkers = 10
 maxdbconnections = 100
 maxdbidleconnections = 50
 batchsize = 5000
+
+now i need alot of data validation
+if nmi-datetime clash, i need to know the previous nmi-datetime-100(filecreationdate) > compare with current 100 filecreationdate > if more than previous > do an update in db record > update the latest nmi-datetime-100(filecreationdate) > i can maintain nmi-datetime-100(filecreationdate) in redis as well
+
+current code will meet with deadlock as processing and write to db run concurrently. parallel write on the same records will deadlock as i generated multiple files of same nmi-datetime....this is an issue

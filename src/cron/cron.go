@@ -34,15 +34,15 @@ func MockDataIngestion() {
 		}
 
 		for _, f := range files {
-			// if err := tools.GenerateNEM12CSV(f.name, f.interval, 50, 50); err != nil {
-			// 	log.Logger.Error("Failed to generate CSV", zap.String("file", f.name), zap.Error(err))
-			// 	continue
-			// }
-
-			if err := tools.GenerateMalformNEM12CSV(f.name, f.interval, 50, 50); err != nil {
+			if err := tools.GenerateNEM12Normal(f.name, f.interval, 50, 50); err != nil {
 				log.Logger.Error("Failed to generate CSV", zap.String("file", f.name), zap.Error(err))
 				continue
 			}
+
+			// if err := tools.GenerateNEM12Malformed(f.name, f.interval, 50, 50); err != nil {
+			// 	log.Logger.Error("Failed to generate CSV", zap.String("file", f.name), zap.Error(err))
+			// 	continue
+			// }
 
 			absPath, _ := filepath.Abs(f.name)
 			worker.EnqueueFile(absPath) // enqueue to worker pool
