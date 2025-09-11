@@ -9,7 +9,7 @@ import (
 type JobQueueEntity struct {
 	ID         int64  `gorm:"primaryKey;autoIncrement"`
 	FilePath   string `gorm:"column:file_path"`
-	Status     string `gorm:"column:status;default:'pending'"` // pending, in_progress, success, failed
+	Status     string `gorm:"column:status;default:'pending'"` // pending, in_progress, success, failed, reject
 	StartedAt  *time.Time
 	FinishedAt *time.Time
 	ErrorMsg   *string `gorm:"column:error_message"`

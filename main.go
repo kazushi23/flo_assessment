@@ -25,12 +25,13 @@ func main() {
 
 	// Initialize logger
 	log.InitLogger(toml.GetConfig().Log.Path, toml.GetConfig().Log.Level)
-
+	fmt.Println(toml.GetConfig().Process.Numworkers, toml.GetConfig().Process.Jobqueuesize, toml.GetConfig().Process.Concurrency)
 	// Start worker pool
-	numWorkers := 5         // number of worker goroutines
-	jobQueueSize := 100     // max pending jobs
-	concurrencyPerFile := 5 // concurrency inside each file processing
+	numWorkers := toml.GetConfig().Process.Numworkers          // number of worker goroutines
+	jobQueueSize := toml.GetConfig().Process.Jobqueuesize      // max pending jobs
+	concurrencyPerFile := toml.GetConfig().Process.Concurrency // concurrency inside each file processing
 	worker.StartWorkerPool(numWorkers, jobQueueSize, concurrencyPerFile)
+	worker.StartAutoRequeue(1)
 
 	// Start cron jobs safely
 	tools.NewPanicGroup().Go(func() {

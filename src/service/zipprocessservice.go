@@ -53,10 +53,10 @@ func (p *ZipProcessServiceImpl) ProcessZipFile(filePath string, fps *FileProcess
 	wg.Wait() // wait for all files to finish
 	close(errCh)
 
-	// Flush any remaining batch
-	if err := fps.flushBatch(); err != nil {
-		return err
-	}
+	// // Flush any remaining batch
+	// if err := fps.flushBatch(); err != nil {
+	// 	return err
+	// }
 
 	if len(errCh) > 0 {
 		var allErrs []string
@@ -82,7 +82,7 @@ func (p *ZipProcessServiceImpl) ProcessZipEntry(f *zip.File, fps *FileProcessSer
 	case strings.HasSuffix(name, ".zip"):
 		return p.ProcessNestedZip(rc, name, fps)
 	case strings.HasSuffix(name, ".csv") || strings.HasSuffix(name, ".mdff"):
-		return ICsvProcessService.ProcessCSVStream(rc, f.Name, fps)
+		return IFileProcessService.RunPipeline(f.Name)
 	default:
 		return nil
 	}

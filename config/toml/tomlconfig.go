@@ -13,6 +13,7 @@ type TomlConfig struct {
 	Mysql       MysqlConfig
 	Redis       RedisConfig
 	Cron        CronConfig
+	Process     ProcessConfig
 }
 
 type LogConfig struct {
@@ -33,6 +34,15 @@ type MysqlConfig struct {
 type RedisConfig struct {
 	Urls     []string
 	Password string
+}
+
+type ProcessConfig struct {
+	Concurrency          int
+	Jobqueuesize         int
+	Numworkers           int
+	Maxdbconnections     int
+	Maxdbidleconnections int
+	Batchsize            int
 }
 
 var c TomlConfig // c is type TomlConfig

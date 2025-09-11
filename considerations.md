@@ -134,3 +134,48 @@ Implement job heartbeats to detect stuck workers
 Store processing progress for large files
 Implement job priority queues
 Add job expiration and cleanup
+
+Potential issues:
+
+Queue full: If more than 100 files are submitted before workers can dequeue, EnqueueFile will drop files (select default).
+
+Backpressure: You have no blocking or retry mechanism. Files will be lost under heavy load.
+
+Memory usage: Each QueueFileJob holds at least file path metadata; not huge, but for very large file lists, memory grows.
+
+Resolution:
+
+Use a larger queue or blocking enqueue.
+
+Optionally, persist jobs in DB for retry if queue is full.
+
+if err := tools.GenerateNEM12CSV(f.name, f.interval, 50, 50); err != nil {
+    log.Logger.Error("Failed to generate CSV", zap.String("file", f.name), zap.Error(err))
+    continue
+}
+
+currently generates 720000 rows and takes about 1-2 minute. too slow
+concurrency = 5
+jobqueuesize = 100
+numworkers = 10
+maxdbconnections = 100
+maxdbidleconnections = 100
+batchsize = 100
+
+currently generates 720000 rows and takes about 30s. too slow
+concurrency = 5
+jobqueuesize = 100
+numworkers = 10
+maxdbconnections = 100
+maxdbidleconnections = 100
+batchsize = 5000
+
+bad row retry is not good but not targewtting yet since it does hit for now. i am testing on valid file
+
+same timing around 30s
+concurrency = 20
+jobqueuesize = 200
+numworkers = 10
+maxdbconnections = 100
+maxdbidleconnections = 50
+batchsize = 5000

@@ -28,18 +28,18 @@ func MockDataIngestion() {
 			interval int
 			name     string
 		}{
-			{5, fmt.Sprintf("nem12_5min_%s.csv", uuidStr)},
-			{15, fmt.Sprintf("nem12_15min_%s.csv", uuidStr)},
+			// {5, fmt.Sprintf("nem12_5min_%s.csv", uuidStr)},
+			// {15, fmt.Sprintf("nem12_15min_%s.csv", uuidStr)},
 			{30, fmt.Sprintf("nem12_30min_%s.csv", uuidStr)},
 		}
 
 		for _, f := range files {
-			// if err := tools.GenerateNEM12CSV(f.name, f.interval, 100, 100); err != nil {
+			// if err := tools.GenerateNEM12CSV(f.name, f.interval, 50, 50); err != nil {
 			// 	log.Logger.Error("Failed to generate CSV", zap.String("file", f.name), zap.Error(err))
 			// 	continue
 			// }
 
-			if err := tools.GenerateMalformNEM12CSV(f.name, f.interval, 5, 5); err != nil {
+			if err := tools.GenerateMalformNEM12CSV(f.name, f.interval, 50, 50); err != nil {
 				log.Logger.Error("Failed to generate CSV", zap.String("file", f.name), zap.Error(err))
 				continue
 			}

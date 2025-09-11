@@ -3,13 +3,16 @@ package service
 import (
 	"context"
 	"encoding/json"
+	config "flo/assessment/config/circuitBreaker"
 	"flo/assessment/config/log"
 	"flo/assessment/config/mysql"
+	"flo/assessment/config/toml"
 	"flo/assessment/entity"
 	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -22,7 +25,6 @@ type FileProcessServiceImpl struct {
 	opts        *ProcessorOptions
 	batch       []entity.MeterReadingsEntity
 	jobErrors   []BatchError
-	batchMutex  sync.Mutex
 	concurrency int
 	sem         chan struct{}
 	workerJobId int
@@ -34,6 +36,11 @@ type BatchError struct {
 	CsvRow   []string
 	Error    error
 	Index    int
+}
+
+type chunkJob struct {
+	rows      []entity.MeterReadingsEntity
+	baseIndex int
 }
 
 // NewZipProcessServiceImpl creates a new service
@@ -65,11 +72,11 @@ type ProcessorOptions struct {
 func DefaultProcessorOptions() *ProcessorOptions {
 	loc, _ := time.LoadLocation("UTC")
 	return &ProcessorOptions{
-		BatchSize:         1000,
+		BatchSize:         toml.GetConfig().Process.Batchsize,
 		InsertTimeout:     30 * time.Second,
 		ParseLocation:     loc,
 		AllowEmptyReading: false,
-		ProgressInterval:  10000,
+		ProgressInterval:  toml.GetConfig().Process.Batchsize / 10,
 	}
 }
 
@@ -84,7 +91,19 @@ func (p *FileProcessServiceImpl) checkContextCancelled() error {
 }
 
 func (p *FileProcessServiceImpl) ProcessFileEntry(filePath string) error {
-	log.Logger.Info("Entry to process zip file", zap.String("zipPath", filePath))
+	log.Logger.Info("Entry to process file", zap.String("filePath", filePath))
+
+	// CRITICAL: Enable bulk optimizations before processing
+	if err := mysql.EnableBulkOptimizations(); err != nil {
+		log.Logger.Warn("Failed to enable bulk optimizations", zap.Error(err))
+	}
+
+	// Ensure we restore settings even if processing fails
+	defer func() {
+		if err := mysql.DisableBulkOptimizations(); err != nil {
+			log.Logger.Warn("Failed to restore database settings", zap.Error(err))
+		}
+	}()
 
 	lowerPath := strings.ToLower(filePath)
 	ext := filepath.Ext(lowerPath)
@@ -92,58 +111,145 @@ func (p *FileProcessServiceImpl) ProcessFileEntry(filePath string) error {
 	switch ext {
 	case ".zip":
 		return IZipProcessService.ProcessZipFile(filePath, p)
-	case ".csv":
-		return ICsvProcessService.ProcessCsvFile(filePath, p)
+	case ".csv", ".mdff":
+		err := p.RunPipeline(filePath)
+		log.Logger.Info("pipeline finished", zap.String("file", filePath), zap.Error(err))
+		return err
+		// return ICsvProcessService.ProcessCsvFile(filePath, p)
 	default:
 		return fmt.Errorf("wrong file type, only csv and zip allowed")
 	}
 }
 
-// addToBatch appends row to batch safely and flushes if batch size reached
-func (p *FileProcessServiceImpl) addToBatch(row entity.MeterReadingsEntity) {
-	p.batchMutex.Lock()
-	p.batch = append(p.batch, row)
-	flushNeeded := len(p.batch) >= p.opts.BatchSize
-	p.batchMutex.Unlock()
+// RunPipeline reads a CSV and writes batches concurrently
+func (p *FileProcessServiceImpl) RunPipeline(filePath string) error {
+	rows := make(chan entity.MeterReadingsEntity, toml.GetConfig().Process.Batchsize*2) // parsed rows
+	batches := make(chan []entity.MeterReadingsEntity, p.concurrency*2)
 
-	if flushNeeded {
-		if err := p.flushBatch(); err != nil {
-			log.Logger.Error("flush batch failed", zap.Error(err))
+	var wg sync.WaitGroup
+
+	// 1. CSV reader goroutine
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := ICsvProcessService.ProcessCsvFileToChannel(filePath, p, rows); err != nil {
+			log.Logger.Error("csv processing failed", zap.Error(err))
 		}
+		close(rows) // no more rows
+	}()
+
+	// 2. Batcher goroutine
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		batch := make([]entity.MeterReadingsEntity, 0, p.opts.BatchSize)
+		for row := range rows {
+			batch = append(batch, row)
+			if len(batch) >= p.opts.BatchSize {
+				copyBatch := make([]entity.MeterReadingsEntity, len(batch))
+				copy(copyBatch, batch)
+				batches <- copyBatch
+				batch = batch[:0]
+			}
+		}
+		if len(batch) > 0 {
+			batches <- batch
+		}
+		close(batches) // no more batches
+	}()
+
+	// 3. DB writer pool
+	for i := 0; i < p.concurrency; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for batch := range batches {
+				ctx, cancel := context.WithTimeout(p.ctx, p.opts.InsertTimeout)
+				_db := mysql.GetDB().WithContext(ctx)
+				errorRows, err := p.insertBatchWithRetry(_db, batch)
+				cancel()
+				if len(errorRows) > 0 {
+					p.handleErrorRows(errorRows) // collect errors
+				}
+				if err != nil {
+					log.Logger.Error("DB insert failed", zap.Int("rows", len(batch)), zap.Error(err))
+				}
+			}
+		}(i)
 	}
-}
 
-// flushBatch inserts batch into DB safely
-func (p *FileProcessServiceImpl) flushBatch() error {
-	p.batchMutex.Lock()
-	if len(p.batch) == 0 {
-		p.batchMutex.Unlock()
-		return nil
+	wg.Wait()
+	if err := p.StoreAllErrors(); err != nil {
+		log.Logger.Error("storing error rows failed", zap.Error(err))
 	}
-
-	batchCopy := make([]entity.MeterReadingsEntity, len(p.batch))
-	copy(batchCopy, p.batch)
-	p.batch = p.batch[:0]
-	p.batchMutex.Unlock()
-
-	ctx, cancel := context.WithTimeout(p.ctx, p.opts.InsertTimeout)
-	defer cancel()
-
-	_db := mysql.GetDB().WithContext(ctx)
-
-	errorRows, err := p.insertBatchWithRetry(_db, batchCopy)
-
-	// Store error rows for later inspection/reporting
-	if len(errorRows) > 0 {
-		p.handleErrorRows(errorRows)
-	}
-
-	if err != nil {
-		log.Logger.Error("batch insert completed with errors", zap.Int("total_rows", len(batchCopy)), zap.Int("failed_rows", len(errorRows)), zap.Error(err))
-	}
-
 	return nil
 }
+
+// // addToBatch appends row to batch safely and flushes if batch size reached
+// func (p *FileProcessServiceImpl) addToBatch(row entity.MeterReadingsEntity) {
+// 	p.batchMutex.Lock()
+// 	p.batch = append(p.batch, row)
+// 	flushNeeded := len(p.batch) >= p.opts.BatchSize
+// 	p.batchMutex.Unlock()
+
+// 	if flushNeeded {
+// 		if err := p.flushBatch(); err != nil {
+// 			log.Logger.Error("flush batch failed", zap.Error(err))
+// 		}
+// 	}
+// }
+
+// flushBatch inserts batch into DB safely
+// func (p *FileProcessServiceImpl) flushBatch() error {
+// 	p.batchMutex.Lock()
+// 	if len(p.batch) == 0 {
+// 		p.batchMutex.Unlock()
+// 		return nil
+// 	}
+
+// 	batchCopy := make([]entity.MeterReadingsEntity, len(p.batch))
+// 	copy(batchCopy, p.batch)
+// 	p.batch = p.batch[:0]
+// 	p.batchMutex.Unlock()
+
+// 	p.sem <- struct{}{}        // acquire slot
+// 	defer func() { <-p.sem }() // release slot
+
+// 	// go func() {
+// 	ctx, cancel := context.WithTimeout(context.Background(), p.opts.InsertTimeout)
+// 	defer cancel()
+
+// 	_db := mysql.GetDB().WithContext(ctx)
+// 	errorRows, err := p.insertBatchWithRetry(_db, batchCopy)
+
+// 	// Store error rows for later inspection/reporting
+// 	if len(errorRows) > 0 {
+// 		p.handleErrorRows(errorRows)
+// 	}
+
+// 	if err != nil {
+// 		log.Logger.Error("batch insert completed with errors", zap.Int("total_rows", len(batchCopy)), zap.Int("failed_rows", len(errorRows)), zap.Error(err))
+// 	}
+// 	// }()
+
+// 	// ctx, cancel := context.WithTimeout(p.ctx, p.opts.InsertTimeout)
+// 	// defer cancel()
+
+// 	// _db := mysql.GetDB().WithContext(ctx)
+
+// 	// errorRows, err := p.insertBatchWithRetry(_db, batchCopy)
+
+// 	// // Store error rows for later inspection/reporting
+// 	// if len(errorRows) > 0 {
+// 	// 	p.handleErrorRows(errorRows)
+// 	// }
+
+// 	// if err != nil {
+// 	// 	log.Logger.Error("batch insert completed with errors", zap.Int("total_rows", len(batchCopy)), zap.Int("failed_rows", len(errorRows)), zap.Error(err))
+// 	// }
+
+// 	return nil
+// }
 
 func (p *FileProcessServiceImpl) insertBatchWithRetry(db *gorm.DB, batch []entity.MeterReadingsEntity) ([]BatchError, error) {
 	if len(batch) == 0 {
@@ -161,10 +267,18 @@ func (p *FileProcessServiceImpl) insertBatchWithRetry(db *gorm.DB, batch []entit
 
 // attemptBatchInsert performs the actual batch insert
 func (p *FileProcessServiceImpl) attemptBatchInsert(db *gorm.DB, batch []entity.MeterReadingsEntity) error {
-	return db.Clauses(clause.OnConflict{
-		Columns:   []clause.Column{{Name: "nmi"}, {Name: "timestamp"}},
-		DoUpdates: clause.AssignmentColumns([]string{"consumption", "updated_at"}),
-	}).CreateInBatches(batch, p.opts.BatchSize).Error
+	return config.RetryWithCircuitBreaker(db, func(tx *gorm.DB) error {
+		res := tx.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "nmi"}, {Name: "timestamp"}},
+			DoUpdates: clause.AssignmentColumns([]string{"consumption", "updated_at"}),
+		}).CreateInBatches(batch, p.opts.BatchSize)
+
+		if res.Error != nil {
+			log.Logger.Error("batch insert error", log.Any("err", res.Error))
+		}
+
+		return res.Error
+	}, 3)
 }
 
 func (p *FileProcessServiceImpl) isolateErrorRows(db *gorm.DB, batch []entity.MeterReadingsEntity) ([]BatchError, error) {
@@ -180,6 +294,8 @@ func (p *FileProcessServiceImpl) isolateErrorRows(db *gorm.DB, batch []entity.Me
 		zap.Int("failed_rows", len(errorRows)))
 
 	if len(errorRows) > 0 {
+		log.Logger.Warn("batch insert failed", zap.Int("rows failed", len(errorRows)))
+
 		return errorRows, fmt.Errorf("batch had %d failed rows out of %d total", len(errorRows), len(batch))
 	}
 
@@ -187,38 +303,90 @@ func (p *FileProcessServiceImpl) isolateErrorRows(db *gorm.DB, batch []entity.Me
 }
 
 func (p *FileProcessServiceImpl) processChunks(db *gorm.DB, batch []entity.MeterReadingsEntity, baseIndex int) ([]BatchError, int) {
-	if len(batch) == 0 {
-		return nil, 0
+	var (
+		errorRows    []BatchError
+		errorMutex   sync.Mutex
+		totalSuccess int32 // use atomic increment
+	)
+
+	queue := []chunkJob{{rows: batch, baseIndex: 0}}
+	sem := make(chan struct{}, p.concurrency) // limit concurrent chunk inserts
+	var wg sync.WaitGroup
+
+	for len(queue) > 0 {
+		job := queue[0]
+		queue = queue[1:]
+
+		if len(job.rows) == 0 {
+			continue
+		}
+
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(job chunkJob) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			err := p.attemptBatchInsert(db, job.rows)
+			if err != nil && len(job.rows) > 1 {
+				// split chunk
+				mid := len(job.rows) / 2
+				queue = append(queue, chunkJob{rows: job.rows[:mid], baseIndex: job.baseIndex})
+				queue = append(queue, chunkJob{rows: job.rows[mid:], baseIndex: job.baseIndex + mid})
+			} else if err != nil {
+				// record failed row
+				errorMutex.Lock()
+				errorRows = append(errorRows, BatchError{
+					MeterRow: job.rows[0],
+					Index:    job.baseIndex,
+					Error:    err,
+				})
+				errorMutex.Unlock()
+			} else {
+				// successful rows
+				atomic.AddInt32(&totalSuccess, int32(len(job.rows)))
+			}
+		}(job)
 	}
 
-	// Try the chunk
-	err := p.attemptBatchInsert(db, batch)
-	if err == nil {
-		return nil, len(batch) // All rows in this chunk succeeded
-	}
+	wg.Wait()
+	return errorRows, int(totalSuccess)
 
-	// If single row, it's the problem
-	if len(batch) == 1 {
-		return []BatchError{{
-			MeterRow: batch[0],
-			Error:    err,
-			Index:    baseIndex,
-		}}, 0
-	}
+	// var errorRows []BatchError
+	// var totalSuccess int
 
-	// Split batch in half and recurse
-	mid := len(batch) / 2
-	leftBatch := batch[:mid]
-	rightBatch := batch[mid:]
+	// queue := []chunkJob{{rows: batch, baseIndex: 0}}
 
-	leftErrors, leftSuccess := p.processChunks(db, leftBatch, baseIndex)
-	rightErrors, rightSuccess := p.processChunks(db, rightBatch, baseIndex+mid)
+	// for len(queue) > 0 {
+	// 	job := queue[0]
+	// 	queue = queue[1:]
 
-	// Combine results
-	allErrors := append(leftErrors, rightErrors...)
-	totalSuccess := leftSuccess + rightSuccess
+	// 	if len(job.rows) == 0 {
+	// 		continue
+	// 	}
 
-	return allErrors, totalSuccess
+	// 	err := p.attemptBatchInsert(db, job.rows)
+	// 	if err == nil {
+	// 		totalSuccess += len(job.rows)
+	// 		continue
+	// 	}
+
+	// 	if len(job.rows) == 1 {
+	// 		errorRows = append(errorRows, BatchError{
+	// 			MeterRow: job.rows[0],
+	// 			Error:    err,
+	// 			Index:    job.baseIndex,
+	// 		})
+	// 		continue
+	// 	}
+
+	// 	// Split into two halves and push to queue
+	// 	mid := len(job.rows) / 2
+	// 	queue = append(queue, chunkJob{rows: job.rows[:mid], baseIndex: job.baseIndex})
+	// 	queue = append(queue, chunkJob{rows: job.rows[mid:], baseIndex: job.baseIndex + mid})
+	// }
+
+	// return errorRows, totalSuccess
 }
 
 func (p *FileProcessServiceImpl) handleErrorRows(errorRows []BatchError) {
@@ -266,13 +434,15 @@ func (p *FileProcessServiceImpl) StoreAllErrors() error {
 		})
 	}
 
-	// Batch insert all error records
-	if len(errorRecords) > 0 {
-		if err := db.CreateInBatches(errorRecords, 100).Error; err != nil {
-			log.Logger.Error("failed to batch store error records", zap.Error(err))
-			return err
-		}
+	if len(errorRecords) == 0 {
+		return nil
 	}
+
+	config.RetryWithCircuitBreaker(db, func(tx *gorm.DB) error {
+		return tx.CreateInBatches(errorRecords, 100).Error
+	}, 3)
+
+	p.jobErrors = p.jobErrors[:0]
 
 	log.Logger.Info("Stored job errors", zap.Int("error_count", len(errorRecords)))
 	return nil
