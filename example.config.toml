@@ -12,8 +12,9 @@ urls = "127.0.0.1:6379"
 password = "password"
 
 [process]
-concurrency = 9
-jobqueuesize = 100
-numworkers = 9
+concurrency = 5
+jobqueuesize = 50
+numworkers = 5
 maxdbconnections = 100
-maxdbidleconnections = 100
+maxdbidleconnections = 50
+batchsize = 2000

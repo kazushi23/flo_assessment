@@ -36,8 +36,8 @@ func generateNEM12(fileName string, intervalMinutes, num200Records, max300Per200
 	defer w.Flush()
 
 	startDate := time.Date(2025, 3, 15, 0, 0, 0, 0, time.UTC)
-	nmiBase := "NEM12" + fmt.Sprintf("%02d", rand.Intn(1000))
-	// nmiBase := "NEM12"
+	// nmiBase := "NEM12" + fmt.Sprintf("%02d", rand.Intn(1000))
+	nmiBase := "NEM12"
 
 	// 100 header
 	w.Write([]string{"100", "NEM12", startDate.Format("20060102150405"), "CNRGYMDP", "NEMMCO"})

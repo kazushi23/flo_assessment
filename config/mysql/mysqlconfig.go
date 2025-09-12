@@ -65,9 +65,8 @@ func init() {
 	// Auto-migrate first
 	if err := _db.AutoMigrate(
 		&entity.MeterReadingsEntity{},
-		&entity.JobQueueEntity{},
+		&entity.StagingMeterReadingEntity{},
 		&entity.ErrorRowsEntity{},
-		&entity.NemFileEntity{},
 	); err != nil {
 		log.Fatal("Migration failed:", err)
 	}

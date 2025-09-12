@@ -35,42 +35,41 @@ func MockDataIngestion() {
 			interval int
 			name     string
 		}{
-			{5, fmt.Sprintf("nem12_5min_%s.csv", uuidStr)},
-			{15, fmt.Sprintf("nem12_15min_%s.csv", uuidStr)},
+			// {5, fmt.Sprintf("nem12_5min_%s.csv", uuidStr)},
+			// {15, fmt.Sprintf("nem12_15min_%s.csv", uuidStr)},
 			{30, fmt.Sprintf("nem12_30min_%s.csv", uuidStr)},
 		}
 
 		for _, f := range files {
-			if err := tools.GenerateNEM12Normal(f.name, f.interval, 50, 50); err != nil {
-				log.Logger.Error("Failed to generate CSV", zap.String("file", f.name), zap.Error(err))
-				continue
-			}
-			// if err := tools.GenerateNEM12Malformed(f.name, f.interval, 50, 50); err != nil {
-			// 	log.Logger.Error("Failed to generate CSV", zap.String("file", f.name), zap.Error(err))
-			// 	continue
-			// }
-			validationErr, nmiExists, err := service.IFileCheckerService.CheckNEMFile(f.name)
-			if err != nil {
-				log.Logger.Error("failed to check file", log.Any("path", f.name))
-				return
-			}
+			f := f
+			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Logger.Error("Recovered from panic in file processing", zap.Any("panic", r), zap.String("file", f.name))
+					}
+				}()
+				// if err := tools.GenerateNEM12Normal(f.name, f.interval, 50, 50); err != nil {
+				// 	log.Logger.Error("Failed to generate CSV", zap.String("file", f.name), zap.Error(err))
+				// 	continue
+				// }
+				if err := tools.GenerateNEM12Malformed(f.name, f.interval, 50, 50); err != nil {
+					log.Logger.Error("Failed to generate CSV", zap.String("file", f.name), zap.Error(err))
+					return
+				}
+				validationErr, err := service.IFileCheckerService.CheckNEMFile(f.name)
+				if err != nil {
+					log.Logger.Error("failed to check file", log.Any("path", f.name))
+					return
+				}
 
-			if len(validationErr) > 0 {
-				log.Logger.Error("file is not valid", zap.String("path", f.name), zap.Any("errors", validationErr))
-				return
-			}
+				if len(validationErr) > 0 {
+					log.Logger.Error("file is not valid", zap.String("path", f.name), zap.Any("errors", validationErr))
+					return
+				}
 
-			if len(nmiExists) > 0 {
-				log.Logger.Error("nmi exist", zap.String("path", f.name))
-				// not sure in real energy sector, what to do with it?
-				// remove those repeated lines from csv and process it, then store repeat in another table as version history?
-				// reject the file as it is malform? and inform the data provider?
-
-				return
-			}
-
-			absPath, _ := filepath.Abs(f.name)
-			worker.EnqueueFile(absPath) // enqueue to worker pool
+				absPath, _ := filepath.Abs(f.name)
+				worker.EnqueueFile(absPath) // enqueue to worker pool
+			}()
 		}
 	})
 }

@@ -80,6 +80,11 @@ func StartWorkerPool(numWorkers, queueSize, concurrencyPerFile int) {
 // worker picks jobs from the queue and processes them
 func worker(id, concurrencyPerFile int) {
 	log.Logger.Info("Worker started", zap.Int("id", id))
+	defer func() {
+		if r := recover(); r != nil {
+			log.Logger.Error("Worker recovered from panic", zap.Any("panic", r))
+		}
+	}()
 
 	for job := range jobQueue {
 		// Retrieve or create job record

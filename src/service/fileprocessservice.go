@@ -3,7 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
-	config "flo/assessment/config/circuitBreaker"
+	config "flo/assessment/config/circuitbreaker"
 	"flo/assessment/config/log"
 	"flo/assessment/config/mysql"
 	"flo/assessment/config/toml"
@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -166,7 +165,7 @@ func (p *FileProcessServiceImpl) RunPipeline(filePath string) error {
 			for batch := range batches {
 				ctx, cancel := context.WithTimeout(p.ctx, p.opts.InsertTimeout)
 				_db := mysql.GetDB().WithContext(ctx)
-				errorRows, err := p.insertBatchWithRetry(_db, batch)
+				errorRows, err := p.insertBatch(_db, batch)
 				cancel()
 				if len(errorRows) > 0 {
 					p.handleErrorRows(errorRows) // collect errors
@@ -185,118 +184,168 @@ func (p *FileProcessServiceImpl) RunPipeline(filePath string) error {
 	return nil
 }
 
-func (p *FileProcessServiceImpl) insertBatchWithRetry(db *gorm.DB, batch []entity.MeterReadingsEntity) ([]BatchError, error) {
+func (p *FileProcessServiceImpl) insertBatch(db *gorm.DB, batch []entity.MeterReadingsEntity) ([]BatchError, error) {
 	if len(batch) == 0 {
 		return nil, nil
 	}
-	err := p.attemptBatchInsert(db, batch)
-	if err == nil {
+	err, backoff := p.attemptBatchInsert(db, batch)
+	if err == nil && !backoff {
 		return nil, nil
 	}
-	log.Logger.Warn("batch insert failed, attempting error isolation", zap.Int("batch_size", len(batch)), zap.Error(err))
 
-	return p.isolateErrorRows(db, batch)
+	log.Logger.Warn("batch insert failed, attempting backoff and store", zap.Int("batch_size", len(batch)), zap.Error(err))
+	stagingErr, _ := p.backoffandstorefirst(db, batch)
+	var batchErrors []BatchError
+
+	if stagingErr != nil {
+		for i, b := range batch {
+			batchErrors = append(batchErrors, BatchError{
+				MeterRow: b,
+				Error:    stagingErr,
+				Index:    i,
+			})
+		}
+		return batchErrors, stagingErr
+	}
+
+	for i, b := range batch {
+		batchErrors = append(batchErrors, BatchError{
+			MeterRow: b,
+			Error:    fmt.Errorf("repeated nmi-timestamp or data integrity issues"),
+			Index:    i,
+		})
+	}
+
+	return batchErrors, err
 
 }
 
 // attemptBatchInsert performs the actual batch insert
-func (p *FileProcessServiceImpl) attemptBatchInsert(db *gorm.DB, batch []entity.MeterReadingsEntity) error {
+func (p *FileProcessServiceImpl) attemptBatchInsert(db *gorm.DB, batch []entity.MeterReadingsEntity) (error, bool) {
+	// when it comes here, data should be almost clean already
+	// data checking and cleaning should be done at the start of data ingestion
+
+	return config.RetryWithCircuitBreaker(db, func(tx *gorm.DB) error {
+		return tx.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "nmi"}, {Name: "timestamp"}},
+			DoUpdates: clause.AssignmentColumns([]string{"consumption", "updated_at"}),
+		}).CreateInBatches(batch, p.opts.BatchSize).Error
+	}, 3)
+
+}
+
+func (p *FileProcessServiceImpl) backoffandstorefirst(db *gorm.DB, batch []entity.MeterReadingsEntity) (error, bool) {
+	stagingBatch := make([]entity.StagingMeterReadingEntity, len(batch))
+	for i, row := range batch {
+		stagingBatch[i] = entity.StagingMeterReadingEntity{
+			Id:               row.Id, // or generate new UUID if needed
+			Nmi:              row.Nmi,
+			Timestamp:        row.Timestamp,
+			Consumption:      row.Consumption,
+			FileCreationDate: row.FileCreationDate, // or actual file date
+			CreatedAt:        row.CreatedAt,
+			UpdatedAt:        row.UpdatedAt,
+		}
+	}
 
 	return config.RetryWithCircuitBreaker(db, func(tx *gorm.DB) error {
 		res := tx.Clauses(clause.OnConflict{
-			Columns:   []clause.Column{{Name: "nmi"}, {Name: "timestamp"}},
+			Columns:   []clause.Column{{Name: "nmi"}, {Name: "timestamp"}, {Name: "file_creation_date"}},
 			DoUpdates: clause.AssignmentColumns([]string{"consumption", "updated_at"}),
-		}).CreateInBatches(batch, p.opts.BatchSize)
-
-		if res.Error != nil {
-			if config.IsPermanentError(res.Error) {
-				// Bad data — log and **return without retry**
-				log.Logger.Error("Permanent batch insert error, skipping retry", log.Any("err", res.Error))
-				return res.Error // retry logic will stop if this is permanent
-			}
-
-			// Transient error — log, allow retry
-			log.Logger.Warn("Transient batch insert error, will retry", log.Any("err", res.Error))
-		}
+		}).CreateInBatches(stagingBatch, p.opts.BatchSize)
 
 		return res.Error
 	}, 3)
 }
 
-func (p *FileProcessServiceImpl) isolateErrorRows(db *gorm.DB, batch []entity.MeterReadingsEntity) ([]BatchError, error) {
-	var errorRows []BatchError
-	var successCount int
+// func (p *FileProcessServiceImpl) insertBatchWithRetry(db *gorm.DB, batch []entity.MeterReadingsEntity) ([]BatchError, error) {
+// 	if len(batch) == 0 {
+// 		return nil, nil
+// 	}
+// 	err := p.attemptBatchInsert(db, batch)
+// 	if err == nil {
+// 		return nil, nil
+// 	}
+// 	log.Logger.Warn("batch insert failed, attempting error isolation", zap.Int("batch_size", len(batch)), zap.Error(err))
 
-	// Process in chunks to isolate bad rows
-	errorRows, successCount = p.processChunks(db, batch, 0)
+// 	return p.isolateErrorRows(db, batch)
 
-	log.Logger.Info("batch processing completed",
-		zap.Int("total_rows", len(batch)),
-		zap.Int("successful_rows", successCount),
-		zap.Int("failed_rows", len(errorRows)))
+// }
 
-	if len(errorRows) > 0 {
-		log.Logger.Warn("batch insert failed", zap.Int("rows failed", len(errorRows)))
+// func (p *FileProcessServiceImpl) isolateErrorRows(db *gorm.DB, batch []entity.MeterReadingsEntity) ([]BatchError, error) {
+// 	var errorRows []BatchError
+// 	var successCount int
 
-		return errorRows, fmt.Errorf("batch had %d failed rows out of %d total", len(errorRows), len(batch))
-	}
+// 	// Process in chunks to isolate bad rows
+// 	errorRows, successCount = p.processChunks(db, batch, 0)
 
-	return nil, nil
-}
+// 	log.Logger.Info("batch processing completed",
+// 		zap.Int("total_rows", len(batch)),
+// 		zap.Int("successful_rows", successCount),
+// 		zap.Int("failed_rows", len(errorRows)))
 
-func (p *FileProcessServiceImpl) processChunks(db *gorm.DB, batch []entity.MeterReadingsEntity, baseIndex int) ([]BatchError, int) {
-	var errorRows []BatchError
-	var totalSuccess int32
+// 	if len(errorRows) > 0 {
+// 		log.Logger.Warn("batch insert failed", zap.Int("rows failed", len(errorRows)))
 
-	chunkCh := make(chan chunkJob, len(batch))
-	resultCh := make(chan BatchError, len(batch))
-	var wg sync.WaitGroup
+// 		return errorRows, fmt.Errorf("batch had %d failed rows out of %d total", len(errorRows), len(batch))
+// 	}
 
-	// Seed the first job
-	chunkCh <- chunkJob{rows: batch, baseIndex: baseIndex}
-	close(chunkCh) // we'll refill it dynamically in the worker
+// 	return nil, nil
+// }
 
-	worker := func() {
-		for job := range chunkCh {
-			err := p.attemptBatchInsert(db, job.rows)
-			if err != nil && len(job.rows) > 1 {
-				// split into two halves
-				mid := len(job.rows) / 2
-				// push new chunks into a local slice, which we send to channel after
-				chunkCh <- chunkJob{rows: job.rows[:mid], baseIndex: job.baseIndex}
-				chunkCh <- chunkJob{rows: job.rows[mid:], baseIndex: job.baseIndex + mid}
-			} else if err != nil {
-				resultCh <- BatchError{
-					MeterRow: job.rows[0],
-					Index:    job.baseIndex,
-					Error:    err,
-				}
-			} else {
-				atomic.AddInt32(&totalSuccess, int32(len(job.rows)))
-			}
-		}
-	}
+// func (p *FileProcessServiceImpl) processChunks(db *gorm.DB, batch []entity.MeterReadingsEntity, baseIndex int) ([]BatchError, int) {
+// 	var errorRows []BatchError
+// 	var totalSuccess int32
 
-	// Start workers
-	concurrency := p.concurrency
-	wg.Add(concurrency)
-	for i := 0; i < concurrency; i++ {
-		go func() {
-			defer wg.Done()
-			worker()
-		}()
-	}
+// 	chunkCh := make(chan chunkJob, len(batch))
+// 	resultCh := make(chan BatchError, len(batch))
+// 	var wg sync.WaitGroup
 
-	wg.Wait()
-	close(resultCh)
+// 	// Seed the first job
+// 	chunkCh <- chunkJob{rows: batch, baseIndex: baseIndex}
+// 	close(chunkCh) // we'll refill it dynamically in the worker
 
-	// Collect all errors
-	for e := range resultCh {
-		errorRows = append(errorRows, e)
-	}
+// 	worker := func() {
+// 		for job := range chunkCh {
+// 			err := p.attemptBatchInsert(db, job.rows)
+// 			if err != nil && len(job.rows) > 1 {
+// 				// split into two halves
+// 				mid := len(job.rows) / 2
+// 				// push new chunks into a local slice, which we send to channel after
+// 				chunkCh <- chunkJob{rows: job.rows[:mid], baseIndex: job.baseIndex}
+// 				chunkCh <- chunkJob{rows: job.rows[mid:], baseIndex: job.baseIndex + mid}
+// 			} else if err != nil {
+// 				resultCh <- BatchError{
+// 					MeterRow: job.rows[0],
+// 					Index:    job.baseIndex,
+// 					Error:    err,
+// 				}
+// 			} else {
+// 				atomic.AddInt32(&totalSuccess, int32(len(job.rows)))
+// 			}
+// 		}
+// 	}
 
-	return errorRows, int(totalSuccess)
-}
+// 	// Start workers
+// 	concurrency := p.concurrency
+// 	wg.Add(concurrency)
+// 	for i := 0; i < concurrency; i++ {
+// 		go func() {
+// 			defer wg.Done()
+// 			worker()
+// 		}()
+// 	}
+
+// 	wg.Wait()
+// 	close(resultCh)
+
+// 	// Collect all errors
+// 	for e := range resultCh {
+// 		errorRows = append(errorRows, e)
+// 	}
+
+// 	return errorRows, int(totalSuccess)
+// }
 
 func (p *FileProcessServiceImpl) handleErrorRows(errorRows []BatchError) {
 	if len(errorRows) == 0 {
@@ -334,12 +383,15 @@ func (p *FileProcessServiceImpl) StoreAllErrors() error {
 			log.Logger.Warn("failed to marshal error row data", zap.Error(err))
 			continue // Skip this error row but continue with others
 		}
-
+		errorMsg := ""
+		if errRow.Error != nil {
+			errorMsg = errRow.Error.Error()
+		}
 		errorRecords = append(errorRecords, entity.ErrorRowsEntity{
 			JobID:    int64(p.workerJobId),
 			Data:     dataJSON,
 			FilePath: p.jobPath,
-			Error:    errRow.Error.Error(),
+			Error:    errorMsg,
 		})
 	}
 
@@ -348,19 +400,7 @@ func (p *FileProcessServiceImpl) StoreAllErrors() error {
 	}
 
 	config.RetryWithCircuitBreaker(db, func(tx *gorm.DB) error {
-		err := tx.CreateInBatches(errorRecords, 100).Error
-		if config.IsPermanentError(err) {
-			// Bad data — log and return, stop retrying
-			log.Logger.Error("Permanent batch insert error, skipping retry", log.Any("err", err))
-			return err // RetryWithCircuitBreaker will stop retrying
-		}
-
-		if err != nil {
-			// Transient error — log and allow retry
-			log.Logger.Warn("Transient batch insert error, will retry", log.Any("err", err))
-		}
-
-		return err
+		return tx.CreateInBatches(errorRecords, 100).Error
 	}, 3)
 
 	p.jobErrors = p.jobErrors[:0]

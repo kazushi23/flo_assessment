@@ -212,6 +212,34 @@ tools.GenerateNEM12Normal(f.name, f.interval, 50, 50);
 
 if its just 15 and 30, no issue. further optimisation can be done
 
+2025-09-12 11:12:55.085	info	D:/flo_energy/flo_assessment/src/service/jobqueueservice.go:89	JOB START EXECUTION: 
+2025-09-12 11:12:56.047	info	D:/flo_energy/flo_assessment/src/service/jobqueueservice.go:115	JOB COMPLETED: 
+ABOUT 1 SECOND TO PROCESS 30 MIN INTERVAL DATA DB 61200 RECORDS
+
+FOR 15 MINS DATA
+2025-09-12 11:14:20.058	info	D:/flo_energy/flo_assessment/src/service/jobqueueservice.go:89	JOB START EXECUTION:
+2025-09-12 11:14:22.102	info	D:/flo_energy/flo_assessment/src/service/jobqueueservice.go:115	JOB COMPLETED: 
+ABOUT 2 SECOND TO PROCESS 15 MIN INTERVAL DATA DB 76800 RECORDS
+
+2025-09-12 11:18:26.439	info	D:/flo_energy/flo_assessment/src/service/jobqueueservice.go:89	JOB START EXECUTION: 
+2025-09-12 11:18:31.640	info	D:/flo_energy/flo_assessment/src/service/jobqueueservice.go:115	JOB COMPLETED:
+ABOUT 5 SECOND TO PROCESS 5 MIN INTERVAL DATA DB 366624 RECORDS
+
+BUT THIS I HARDWARE DEPENDANT:
+Intel(R) Core(TM) i7-10700 CPU @ 2.90GHz (2.90 GHz)
+16.0 GB
+SSD
+
+NOW I WILL IMPLEMENT CHECKING. idea i to have 1 node for data preprocessing
+1 node for data ingestion and write in bulk
+1 node for retry mechanism on data that failed
+
+no more retry mechanism and processchunks needed
+
+
+this is a good assignment, the blank cheque made my mind travel to many places as the technical implementation is tied to buisnes requirements, eg. what is the data ingestion method? does data need to be real time? how often data processing occurs? hourly? so i can balance performance vs reliability etc. for now i go for performance.
+
+
 write up on why i choose this combination
 [process]
 concurrency = 5
@@ -242,3 +270,85 @@ have not done processrow and in handle 300, i need to create a record in newfile
 so currently cant run when nmi and timestamp collides, there will be deadlock.
 
 no idea is flawed if a 300 record of time x has 5 min interval, it will still cross datetime with another 300 record of timex 30min interval....
+
+so it is back to onconflict => how to handle => but i will hit deadlock
+
+// nmiBase := "NEM12" + fmt.Sprintf("%02d", rand.Intn(1000)) => diff nem
+nmiBase := "NEM12" => make same nem
+
+i mean i can do a simple check on table index for nmi-timestamp before insert, but not efficient. if found as true, i need another table to find out if this.data filecreationdate > that.data filecreationdate
+
+func (p *FileProcessServiceImpl) attemptBatchInsertDeadlockFree(db *gorm.DB, batch []entity.MeterReadingsEntityWithContext) error {
+	if len(batch) == 0 {
+		return nil
+	}
+
+	return config.RetryWithCircuitBreaker(db, func(tx *gorm.DB) error {
+		// Process records one by one to avoid deadlocks
+		// This is slower but deadlock-free
+		for _, record := range batch {
+			// Check if record exists
+			var existing entity.MeterReadingsEntity
+			result := tx.Where("nmi = ? AND timestamp = ?", record.Nmi, record.Timestamp).
+				First(&existing)
+
+			if result.Error == gorm.ErrRecordNotFound {
+				// Record doesn't exist, insert new
+				if err := tx.Create(&record.MeterReadingsEntity).Error; err != nil {
+					if config.IsPermanentError(err) {
+						log.Logger.Error("Permanent insert error", zap.Error(err))
+						return err
+					}
+					log.Logger.Warn("Transient insert error", zap.Error(err))
+					return err
+				}
+				
+				// Insert tracking record
+				tracking := entity.FileCreationTrackingEntity{
+					ID:               tools.NewUuid(),
+					Nmi:              record.Nmi,
+					Timestamp:        record.Timestamp,
+					FileCreationDate: record.FileCreationDate,
+					FilePath:         record.FilePath,
+				}
+				if err := tx.Create(&tracking).Error; err != nil {
+					log.Logger.Warn("Failed to create tracking record", zap.Error(err))
+				}
+				
+			} else if result.Error != nil {
+				return result.Error
+			} else {
+				// Record exists, check file creation date
+				var existingTracking entity.FileCreationTrackingEntity
+				trackResult := tx.Where("nmi = ? AND timestamp = ?", record.Nmi, record.Timestamp).
+					First(&existingTracking)
+				
+				if trackResult.Error == nil {
+					if record.FileCreationDate.After(existingTracking.FileCreationDate) {
+						// Update both records
+						if err := tx.Where("nmi = ? AND timestamp = ?", record.Nmi, record.Timestamp).
+							Updates(map[string]interface{}{
+								"consumption": record.Consumption,
+								"updated_at":  time.Now().UnixMilli(),
+							}).Error; err != nil {
+							return err
+						}
+						
+						if err := tx.Where("nmi = ? AND timestamp = ?", record.Nmi, record.Timestamp).
+							Model(&entity.FileCreationTrackingEntity{}).
+							Updates(map[string]interface{}{
+								"file_creation_date": record.FileCreationDate,
+								"file_path":         record.FilePath,
+								"updated_at":        time.Now().UnixMilli(),
+							}).Error; err != nil {
+							log.Logger.Warn("Failed to update tracking record", zap.Error(err))
+						}
+					}
+					// If existing is newer, skip (do nothing)
+				}
+			}
+		}
+		
+		return nil
+	}, 3)
+}

@@ -2,14 +2,10 @@ package service
 
 import (
 	"bufio"
-	"flo/assessment/config/mysql"
-	"flo/assessment/entity"
 	"fmt"
 	"os"
 	"strconv"
 	"strings"
-
-	"gorm.io/gorm"
 )
 
 type ValidationError struct {
@@ -17,81 +13,82 @@ type ValidationError struct {
 	Message string
 }
 
-type NMIInterval struct {
-	NMI            string
-	IntervalDate   string
-	FileCreateDate string // from 100 record, fields[2]
-}
+// type NMIInterval struct {
+// 	NMI            string
+// 	IntervalDate   string
+// 	FileCreateDate string // from 100 record, fields[2]
+// }
 
 type FileCheckerServiceImpl struct {
 }
 
-// Check if NMI + IntervalDate exists in the database
-func (f *FileCheckerServiceImpl) NmiIntervalExists(nmi string, intervalDate string, fileCreationDate string, currentIntervalLength int) (bool, error) {
-	// check if this combination is processed before with NEMFILEENTITY
-	// nmi (300) - intervalDate (300) - currentIntervalLength (200)
-	// if exist, check the filecreationDate
-	// needsUpdate => so that i can trigger processrow later (only if this.filecreationdate > db.filecreationdate)
-	// if needsUpdate == true => update redis or whereever i am keeping the combination of nmi-intervalDate-currentIntervalLength: fileCreationDate
-	db := mysql.GetDB()
-	var record entity.NemFileEntity
+// // Check if NMI + IntervalDate exists in the database
+// func (f *FileCheckerServiceImpl) NmiIntervalExists(nmi string, intervalDate string, fileCreationDate string, currentIntervalLength int) (bool, error) {
+// 	// check if this combination is processed before with NEMFILEENTITY
+// 	// nmi (300) - intervalDate (300) - currentIntervalLength (200)
+// 	// if exist, check the filecreationDate
+// 	// needsUpdate => so that i can trigger processrow later (only if this.filecreationdate > db.filecreationdate)
+// 	// if needsUpdate == true => update redis or whereever i am keeping the combination of nmi-intervalDate-currentIntervalLength: fileCreationDate
+// 	db := mysql.GetDB()
+// 	var record entity.NemFileEntity
 
-	parsedIntervalDate, err := ICsvProcessService.ParseIntervalDates(intervalDate)
-	if err != nil {
-		return false, fmt.Errorf("invalid interval date: %w", err)
-	}
+// 	parsedIntervalDate, err := ICsvProcessService.ParseIntervalDates(intervalDate)
+// 	if err != nil {
+// 		return false, fmt.Errorf("invalid interval date: %w", err)
+// 	}
 
-	parsedFileDate, err := ICsvProcessService.ParseIntervalDates(fileCreationDate)
-	if err != nil {
-		return false, fmt.Errorf("invalid file creation date: %w", err)
-	}
+// 	parsedFileDate, err := ICsvProcessService.ParseIntervalDates(fileCreationDate)
+// 	if err != nil {
+// 		return false, fmt.Errorf("invalid file creation date: %w", err)
+// 	}
 
-	err = db.Where("nmi = ? AND interval_length = ? AND interval_date = ?", nmi, currentIntervalLength, parsedIntervalDate).
-		First(&record).Error
+// 	err = db.Where("nmi = ? AND interval_length = ? AND interval_date = ?", nmi, currentIntervalLength, parsedIntervalDate).
+// 		First(&record).Error
 
-	if err == gorm.ErrRecordNotFound {
-		// No record, skip processing (row will not duplicate)
-		return false, nil
-	} else if err != nil {
-		return false, err
-	}
+// 	if err == gorm.ErrRecordNotFound {
+// 		// No record, skip processing (row will not duplicate)
+// 		return false, nil
+// 	} else if err != nil {
+// 		return false, err
+// 	}
 
-	// Row exists, check file creation date
-	if parsedFileDate.After(record.FileCreationDate) {
-		// Incoming file is newer, update record to trigger processing
-		record.FileCreationDate = parsedFileDate
-		if err := db.Save(&record).Error; err != nil {
-			return false, err
-		}
-		return true, nil
-	}
+// 	// Row exists, check file creation date
+// 	if parsedFileDate.After(record.FileCreationDate) {
+// 		// Incoming file is newer, update record to trigger processing
+// 		record.FileCreationDate = parsedFileDate
+// 		if err := db.Save(&record).Error; err != nil {
+// 			return false, err
+// 		}
+// 		return true, nil
+// 	}
 
-	// Row exists but file is older, skip processing
-	return false, nil
-}
-func (f *FileCheckerServiceImpl) ProcessRow(row []string, currentIntervalLength int) error {
-	// update the entire row into db
+// 	// Row exists but file is older, skip processing
+// 	return false, nil
+// }
+// func (f *FileCheckerServiceImpl) ProcessRow(row []string, currentIntervalLength int) error {
+// 	// update the entire row into db
 
-	return nil
-}
+// 	return nil
+// }
 
 // CheckNEMFile validates a NEM12/13 file
-func (f *FileCheckerServiceImpl) CheckNEMFile(path string) ([]ValidationError, []NMIInterval, error) {
+// Validate file, any error reject as file integrity is wrong
+// Flag this out to data owner, DO NOT PROCESS ANYTHING
+func (f *FileCheckerServiceImpl) CheckNEMFile(path string) ([]ValidationError, error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	defer file.Close()
 
 	scanner := bufio.NewScanner(file)
 	var lineNum int
 	var errors []ValidationError
-	var nmiIntervals []NMIInterval
 
 	headerFound := false
 	endFound := false
 	nemVersion := ""
-	fileCreateDate := ""
+	// fileCreateDate := ""
 	currentNMI := ""           // track NMI from 200 record
 	currentIntervalLength := 0 // interval length from 200 record
 
@@ -116,7 +113,7 @@ func (f *FileCheckerServiceImpl) CheckNEMFile(path string) ([]ValidationError, [
 				errors = append(errors, ValidationError{lineNum, "header must have at least 5 fields"})
 			}
 			nemVersion = fields[1]
-			fileCreateDate = fields[2] // store file creation datetime
+			// fileCreateDate = fields[2] // store file creation datetime
 			if nemVersion != "NEM12" && nemVersion != "NEM13" {
 				errors = append(errors, ValidationError{lineNum, "unsupported version: " + nemVersion})
 			}
@@ -158,28 +155,45 @@ func (f *FileCheckerServiceImpl) CheckNEMFile(path string) ([]ValidationError, [
 				continue
 			}
 
+			dateStr := strings.TrimSpace(fields[1])
+			_, err := ICsvProcessService.ParseIntervalDates(dateStr)
+			if err != nil {
+				errors = append(errors, ValidationError{
+					Line:    lineNum,
+					Message: err.Error(),
+				})
+			}
 			// Validate interval values count
 			expectedValues := 1440 / currentIntervalLength
-			actualValues := len(fields) - 4 // skip "300", IntervalDate, last 3 metadata fields
+			actualValues := len(fields) - 7 // skip RecordIndicator,IntervalDate,QualityMethod,ReasonCode,ReasonDescription,UpdateDateTime,MSATSLoadDateTime
+			// Too few values
 			if actualValues < expectedValues {
-				errors = append(errors, ValidationError{lineNum,
-					fmt.Sprintf("not enough interval values: expected %d got %d", expectedValues, actualValues)})
+				errors = append(errors, ValidationError{
+					Line:    lineNum,
+					Message: fmt.Sprintf("not enough interval values: expected %d got %d", expectedValues, actualValues),
+				})
 			}
 
-			// Validate NMI + IntervalDate in DB
-			intervalDate := fields[1]
-			needsProcessing, dbErr := f.NmiIntervalExists(currentNMI, intervalDate, fileCreateDate, currentIntervalLength)
-			if dbErr != nil {
-				return nil, nil, dbErr
-			}
-			if needsProcessing {
-				nmiIntervals = append(nmiIntervals, NMIInterval{
-					NMI:            currentNMI,
-					IntervalDate:   intervalDate,
-					FileCreateDate: fileCreateDate,
+			// Too many values
+			if actualValues > expectedValues {
+				errors = append(errors, ValidationError{
+					Line:    lineNum,
+					Message: fmt.Sprintf("too many interval values: expected %d got %d", expectedValues, actualValues),
 				})
-				// remove row from csv
-				// call processrow
+			}
+
+			// Attempt to parse values that exist
+			for i := 0; i < min(expectedValues, actualValues); i++ {
+				raw := strings.TrimSpace(fields[2+i])
+				if raw == "" {
+					continue // allow empty -> handled later
+				}
+				if _, err := strconv.ParseFloat(strings.ReplaceAll(raw, ",", ""), 64); err != nil {
+					errors = append(errors, ValidationError{
+						Line:    lineNum,
+						Message: fmt.Sprintf("invalid float at interval %d: %v", i+1, err),
+					})
+				}
 			}
 
 		case "400":
@@ -200,5 +214,5 @@ func (f *FileCheckerServiceImpl) CheckNEMFile(path string) ([]ValidationError, [
 		errors = append(errors, ValidationError{0, "end record not found"})
 	}
 
-	return errors, nmiIntervals, scanner.Err()
+	return errors, scanner.Err()
 }
