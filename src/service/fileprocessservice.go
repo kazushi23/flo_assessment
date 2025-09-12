@@ -19,6 +19,7 @@ import (
 	"gorm.io/gorm/clause"
 )
 
+// one instance utilise from start to end for one parallel data processing flow
 type FileProcessServiceImpl struct {
 	ctx         context.Context
 	opts        *ProcessorOptions
@@ -30,16 +31,12 @@ type FileProcessServiceImpl struct {
 	jobPath     string
 }
 
+// when db insertion fail, entire batch will push into errorrowsentity
 type BatchError struct {
 	MeterRow entity.MeterReadingsEntity
 	CsvRow   []string
 	Error    error
 	Index    int
-}
-
-type chunkJob struct {
-	rows      []entity.MeterReadingsEntity
-	baseIndex int
 }
 
 // NewZipProcessServiceImpl creates a new service
@@ -89,18 +86,19 @@ func (p *FileProcessServiceImpl) checkContextCancelled() error {
 	}
 }
 
+// entry point to kickstart data processing
 func (p *FileProcessServiceImpl) ProcessFileEntry(filePath string) error {
-	log.Logger.Info("Entry to process file", zap.String("filePath", filePath))
+	log.Logger.Info("Entry to process file", log.Any("filePath", filePath))
 
-	// CRITICAL: Enable bulk optimizations before processing
+	// Enable bulk optimizations before processing (further optimisation can be done)
 	if err := mysql.EnableBulkOptimizations(); err != nil {
-		log.Logger.Warn("Failed to enable bulk optimizations", zap.Error(err))
+		log.Logger.Warn("Failed to enable bulk optimizations", log.Any("error", err))
 	}
 
 	// Ensure we restore settings even if processing fails
 	defer func() {
 		if err := mysql.DisableBulkOptimizations(); err != nil {
-			log.Logger.Warn("Failed to restore database settings", zap.Error(err))
+			log.Logger.Warn("Failed to restore database settings", log.Any("error", err))
 		}
 	}()
 
@@ -108,15 +106,16 @@ func (p *FileProcessServiceImpl) ProcessFileEntry(filePath string) error {
 	ext := filepath.Ext(lowerPath)
 
 	switch ext {
-	case ".zip":
+	case ".zip": // for zip file (not really in play at the moment)
 		return IZipProcessService.ProcessZipFile(filePath, p)
-	case ".csv", ".mdff":
+	case ".csv", ".mdff": // for csv and mdff file (main processing path)
 		err := p.RunPipeline(filePath)
-		log.Logger.Info("pipeline finished", zap.String("file", filePath), zap.Error(err))
+		log.Logger.Info("pipeline finished", log.Any("file", filePath), log.Any("error", err))
 		return err
-		// return ICsvProcessService.ProcessCsvFile(filePath, p)
 	default:
-		return fmt.Errorf("wrong file type, only csv and zip allowed")
+		err := fmt.Errorf("wrong file type, only csv and zip allowed")
+		log.Logger.Info("unable to handle file", log.Any("error", err))
+		return err
 	}
 }
 
@@ -127,24 +126,27 @@ func (p *FileProcessServiceImpl) RunPipeline(filePath string) error {
 
 	var wg sync.WaitGroup
 
-	// 1. CSV reader goroutine
+	// CSV reader goroutine
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		// process csv (200/300/etc)
 		if err := ICsvProcessService.ProcessCsvFileToChannel(filePath, p, rows); err != nil {
-			log.Logger.Error("csv processing failed", zap.Error(err))
+			log.Logger.Error("csv processing failed", log.Any("error", err))
 		}
 		close(rows) // no more rows
 	}()
 
-	// 2. Batcher goroutine
+	// Batch goroutine
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		// init based on batch size configuration
 		batch := make([]entity.MeterReadingsEntity, 0, p.opts.BatchSize)
 		for row := range rows {
 			batch = append(batch, row)
 			if len(batch) >= p.opts.BatchSize {
+				// copy and release to prevent holding on batch for too long
 				copyBatch := make([]entity.MeterReadingsEntity, len(batch))
 				copy(copyBatch, batch)
 				batches <- copyBatch
@@ -157,7 +159,7 @@ func (p *FileProcessServiceImpl) RunPipeline(filePath string) error {
 		close(batches) // no more batches
 	}()
 
-	// 3. DB writer pool
+	// DB writer pool
 	for i := 0; i < p.concurrency; i++ {
 		wg.Add(1)
 		go func(workerID int) {
@@ -165,39 +167,41 @@ func (p *FileProcessServiceImpl) RunPipeline(filePath string) error {
 			for batch := range batches {
 				ctx, cancel := context.WithTimeout(p.ctx, p.opts.InsertTimeout)
 				_db := mysql.GetDB().WithContext(ctx)
+				// insert into db the data
 				errorRows, err := p.insertBatch(_db, batch)
 				cancel()
 				if len(errorRows) > 0 {
 					p.handleErrorRows(errorRows) // collect errors
 				}
 				if err != nil {
-					log.Logger.Error("DB insert failed", zap.Int("rows", len(batch)), zap.Error(err))
+					log.Logger.Error("DB insert failed", zap.Int("rows", len(batch)), log.Any("error", err))
 				}
 			}
 		}(i)
 	}
 
-	wg.Wait()
+	wg.Wait() // after all 3 goroutines are done, store all errors that occurred
 	if err := p.StoreAllErrors(); err != nil {
-		log.Logger.Error("storing error rows failed", zap.Error(err))
+		log.Logger.Error("storing error rows failed", log.Any("error", err))
 	}
 	return nil
 }
 
+// attempt to write to db, if failed, write to retry table (stagingmeterentity)
 func (p *FileProcessServiceImpl) insertBatch(db *gorm.DB, batch []entity.MeterReadingsEntity) ([]BatchError, error) {
 	if len(batch) == 0 {
 		return nil, nil
 	}
-	err, backoff := p.attemptBatchInsert(db, batch)
-	if err == nil && !backoff {
+	err, backoff := p.attemptBatchInsert(db, batch) // bulk insert into db
+	if err == nil && !backoff {                     // all is good, no error, no backoff
 		return nil, nil
 	}
 
-	log.Logger.Warn("batch insert failed, attempting backoff and store", zap.Int("batch_size", len(batch)), zap.Error(err))
-	stagingErr, _ := p.backoffandstorefirst(db, batch)
+	log.Logger.Warn("batch insert failed, attempting backoff and store", zap.Int("batch_size", len(batch)), log.Any("error", err))
+	stagingErr, _ := p.backoffandstorefirst(db, batch) // backoff needed, push data to staging table
 	var batchErrors []BatchError
 
-	if stagingErr != nil {
+	if stagingErr != nil { // retrieve all batch errors
 		for i, b := range batch {
 			batchErrors = append(batchErrors, BatchError{
 				MeterRow: b,
@@ -208,7 +212,7 @@ func (p *FileProcessServiceImpl) insertBatch(db *gorm.DB, batch []entity.MeterRe
 		return batchErrors, stagingErr
 	}
 
-	for i, b := range batch {
+	for i, b := range batch { // retrieve all batch errors
 		batchErrors = append(batchErrors, BatchError{
 			MeterRow: b,
 			Error:    fmt.Errorf("repeated nmi-timestamp or data integrity issues"),
@@ -234,17 +238,17 @@ func (p *FileProcessServiceImpl) attemptBatchInsert(db *gorm.DB, batch []entity.
 
 }
 
+// safety mechanism, batchinsert focus on speed and performance
+// anything do wrong, go into safe mode (staging table + future single thread processing)
 func (p *FileProcessServiceImpl) backoffandstorefirst(db *gorm.DB, batch []entity.MeterReadingsEntity) (error, bool) {
 	stagingBatch := make([]entity.StagingMeterReadingEntity, len(batch))
 	for i, row := range batch {
 		stagingBatch[i] = entity.StagingMeterReadingEntity{
-			Id:               row.Id, // or generate new UUID if needed
+			Id:               row.Id,
 			Nmi:              row.Nmi,
 			Timestamp:        row.Timestamp,
 			Consumption:      row.Consumption,
-			FileCreationDate: row.FileCreationDate, // or actual file date
-			CreatedAt:        row.CreatedAt,
-			UpdatedAt:        row.UpdatedAt,
+			FileCreationDate: row.FileCreationDate,
 		}
 	}
 
@@ -258,6 +262,82 @@ func (p *FileProcessServiceImpl) backoffandstorefirst(db *gorm.DB, batch []entit
 	}, 3)
 }
 
+// add batch error to p.jobErrors
+func (p *FileProcessServiceImpl) handleErrorRows(errorRows []BatchError) {
+	if len(errorRows) == 0 {
+		return
+	}
+	p.jobErrors = append(p.jobErrors, errorRows...)
+}
+
+// add csv fields to batcherror to p.joberror
+func (p *FileProcessServiceImpl) addErrorRowCSV(fields []string, err error) {
+	if p.jobErrors == nil {
+		p.jobErrors = make([]BatchError, 0)
+	}
+	p.jobErrors = append(p.jobErrors, BatchError{
+		CsvRow: fields, // raw CSV row
+		Error:  err,
+	})
+}
+
+// store all errors
+func (p *FileProcessServiceImpl) StoreAllErrors() error {
+	if len(p.jobErrors) == 0 {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(p.ctx, p.opts.InsertTimeout)
+	defer cancel()
+
+	db := mysql.GetDB().WithContext(ctx)
+
+	// Prepare all error records for batch insert
+	errorRecords := make([]entity.ErrorRowsEntity, 0, len(p.jobErrors))
+
+	for _, errRow := range p.jobErrors {
+		var dataJSON json.RawMessage
+		var err error
+
+		// Handle both CSV and MeterRow errors
+		if errRow.MeterRow.Nmi != "" {
+			// Database insert error - marshal MeterRow
+			dataJSON, err = json.Marshal(errRow.MeterRow)
+		} else if len(errRow.CsvRow) > 0 {
+			// CSV parsing error - marshal raw CSV row
+			dataJSON, err = json.Marshal(errRow.CsvRow)
+		}
+
+		if err != nil {
+			log.Logger.Warn("failed to marshal error row data", log.Any("error", err))
+			continue // Skip this error row but continue with others
+		}
+		errorMsg := ""
+		if errRow.Error != nil {
+			errorMsg = errRow.Error.Error()
+		}
+		errorRecords = append(errorRecords, entity.ErrorRowsEntity{
+			JobID:    int64(p.workerJobId),
+			Data:     dataJSON,
+			FilePath: p.jobPath,
+			Error:    errorMsg,
+		})
+	}
+
+	if len(errorRecords) == 0 {
+		return nil
+	}
+	// write to db
+	config.RetryWithCircuitBreaker(db, func(tx *gorm.DB) error {
+		return tx.CreateInBatches(errorRecords, 100).Error
+	}, 3)
+
+	p.jobErrors = p.jobErrors[:0] // clear out
+
+	log.Logger.Info("Stored job errors", zap.Int("error_count", len(errorRecords)))
+	return nil
+}
+
 // func (p *FileProcessServiceImpl) insertBatchWithRetry(db *gorm.DB, batch []entity.MeterReadingsEntity) ([]BatchError, error) {
 // 	if len(batch) == 0 {
 // 		return nil, nil
@@ -266,7 +346,7 @@ func (p *FileProcessServiceImpl) backoffandstorefirst(db *gorm.DB, batch []entit
 // 	if err == nil {
 // 		return nil, nil
 // 	}
-// 	log.Logger.Warn("batch insert failed, attempting error isolation", zap.Int("batch_size", len(batch)), zap.Error(err))
+// 	log.Logger.Warn("batch insert failed, attempting error isolation", zap.Int("batch_size", len(batch)), log.Any(err))
 
 // 	return p.isolateErrorRows(db, batch)
 
@@ -346,75 +426,3 @@ func (p *FileProcessServiceImpl) backoffandstorefirst(db *gorm.DB, batch []entit
 
 // 	return errorRows, int(totalSuccess)
 // }
-
-func (p *FileProcessServiceImpl) handleErrorRows(errorRows []BatchError) {
-	if len(errorRows) == 0 {
-		return
-	}
-	p.jobErrors = append(p.jobErrors, errorRows...)
-}
-func (p *FileProcessServiceImpl) StoreAllErrors() error {
-	if len(p.jobErrors) == 0 {
-		return nil
-	}
-
-	ctx, cancel := context.WithTimeout(p.ctx, p.opts.InsertTimeout)
-	defer cancel()
-
-	db := mysql.GetDB().WithContext(ctx)
-
-	// Prepare all error records for batch insert
-	errorRecords := make([]entity.ErrorRowsEntity, 0, len(p.jobErrors))
-
-	for _, errRow := range p.jobErrors {
-		var dataJSON json.RawMessage
-		var err error
-
-		// Handle both CSV and MeterRow errors
-		if errRow.MeterRow.Nmi != "" {
-			// Database insert error - marshal MeterRow
-			dataJSON, err = json.Marshal(errRow.MeterRow)
-		} else if len(errRow.CsvRow) > 0 {
-			// CSV parsing error - marshal raw CSV row
-			dataJSON, err = json.Marshal(errRow.CsvRow)
-		}
-
-		if err != nil {
-			log.Logger.Warn("failed to marshal error row data", zap.Error(err))
-			continue // Skip this error row but continue with others
-		}
-		errorMsg := ""
-		if errRow.Error != nil {
-			errorMsg = errRow.Error.Error()
-		}
-		errorRecords = append(errorRecords, entity.ErrorRowsEntity{
-			JobID:    int64(p.workerJobId),
-			Data:     dataJSON,
-			FilePath: p.jobPath,
-			Error:    errorMsg,
-		})
-	}
-
-	if len(errorRecords) == 0 {
-		return nil
-	}
-
-	config.RetryWithCircuitBreaker(db, func(tx *gorm.DB) error {
-		return tx.CreateInBatches(errorRecords, 100).Error
-	}, 3)
-
-	p.jobErrors = p.jobErrors[:0]
-
-	log.Logger.Info("Stored job errors", zap.Int("error_count", len(errorRecords)))
-	return nil
-}
-
-func (p *FileProcessServiceImpl) addErrorRowCSV(fields []string, err error) {
-	if p.jobErrors == nil {
-		p.jobErrors = make([]BatchError, 0)
-	}
-	p.jobErrors = append(p.jobErrors, BatchError{
-		CsvRow: fields, // raw CSV row
-		Error:  err,
-	})
-}

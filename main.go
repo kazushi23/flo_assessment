@@ -25,13 +25,12 @@ func main() {
 
 	// Initialize logger
 	log.InitLogger(toml.GetConfig().Log.Path, toml.GetConfig().Log.Level)
-	fmt.Println(toml.GetConfig().Process.Numworkers, toml.GetConfig().Process.Jobqueuesize, toml.GetConfig().Process.Concurrency)
 	// Start worker pool
-	numWorkers := toml.GetConfig().Process.Numworkers          // number of worker goroutines
-	jobQueueSize := toml.GetConfig().Process.Jobqueuesize      // max pending jobs
-	concurrencyPerFile := toml.GetConfig().Process.Concurrency // concurrency inside each file processing
-	worker.StartWorkerPool(numWorkers, jobQueueSize, concurrencyPerFile)
-	worker.StartAutoRequeue(1)
+	numWorkers := toml.GetConfig().Process.Numworkers                    // number of worker goroutines
+	jobQueueSize := toml.GetConfig().Process.Jobqueuesize                // max pending jobs
+	concurrencyPerFile := toml.GetConfig().Process.Concurrency           // concurrency inside each file processing
+	worker.StartWorkerPool(numWorkers, jobQueueSize, concurrencyPerFile) // init worker pool
+	worker.StartAutoRequeue(1)                                           // to handle rejected jobs
 
 	// Start cron jobs safely
 	tools.NewPanicGroup().Go(func() {
@@ -40,8 +39,10 @@ func main() {
 				log.Logger.Error("Recovered panic in cron job", zap.Any("panic", r))
 			}
 		}()
-		cron.MockDataIngestion()
+		cron.MockDataIngestion() // data ingestion triggering point
 	})
+
+	cron.StartStagingProcessor(200, 10)
 
 	r := gin.Default()
 	r.GET("/health", func(c *gin.Context) {

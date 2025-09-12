@@ -39,7 +39,7 @@ func (p *ZipProcessServiceImpl) ProcessZipFile(filePath string, fps *FileProcess
 		go func(f *zip.File) {
 			defer wg.Done()
 			defer func() { <-fps.sem }()
-
+			// entry point for zip file
 			if err := p.ProcessZipEntry(f, fps); err != nil {
 				select {
 				case errCh <- fmt.Errorf("entry %s: %w", f.Name, err):
@@ -52,11 +52,6 @@ func (p *ZipProcessServiceImpl) ProcessZipFile(filePath string, fps *FileProcess
 
 	wg.Wait() // wait for all files to finish
 	close(errCh)
-
-	// // Flush any remaining batch
-	// if err := fps.flushBatch(); err != nil {
-	// 	return err
-	// }
 
 	if len(errCh) > 0 {
 		var allErrs []string
@@ -80,9 +75,9 @@ func (p *ZipProcessServiceImpl) ProcessZipEntry(f *zip.File, fps *FileProcessSer
 	name := strings.ToLower(f.Name)
 	switch {
 	case strings.HasSuffix(name, ".zip"):
-		return p.ProcessNestedZip(rc, name, fps)
+		return p.ProcessNestedZip(rc, name, fps) // re-unzip again if current file is zip
 	case strings.HasSuffix(name, ".csv") || strings.HasSuffix(name, ".mdff"):
-		return IFileProcessService.RunPipeline(f.Name)
+		return IFileProcessService.RunPipeline(f.Name) // throw into csv processing pipeline
 	default:
 		return nil
 	}

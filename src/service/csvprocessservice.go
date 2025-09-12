@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/csv"
 	"errors"
+	"flo/assessment/config/log"
 	"flo/assessment/entity"
 	"flo/assessment/src/tools"
 	"fmt"
@@ -43,6 +44,7 @@ func (p *CsvProcessServiceImpl) ProcessCsvFileToChannel(filePath string, fps *Fi
 			if errors.Is(err, io.EOF) {
 				return nil
 			}
+			log.Logger.Error("csv read error", log.Any("error", err))
 			return fmt.Errorf("csv read: %w", err)
 		}
 		if len(fields) == 0 {
@@ -58,7 +60,7 @@ func (p *CsvProcessServiceImpl) ProcessCsvFileToChannel(filePath string, fps *Fi
 			// RecordIndicator,VersionHeader,DateTime,FromParticipant,ToParticipant
 			fileCreationDate = fields[2]
 		case "200":
-			nmi, interval := p.handle200(fields, recordCount, fps)
+			nmi, interval := p.handle200(fields)
 			currentNMI = nmi
 			currentInterval = interval
 		case "300":
@@ -72,14 +74,9 @@ func (p *CsvProcessServiceImpl) ProcessCsvFileToChannel(filePath string, fps *Fi
 }
 
 // data here should be clean already due to pre-processing
-func (p *CsvProcessServiceImpl) handle300ToChannel(
-	fields []string,
-	currentNMI string,
-	currentInterval int,
-	fps *FileProcessServiceImpl,
-	out chan<- entity.MeterReadingsEntity,
-	fileCreationDateStr string,
-) {
+// 300,20030501,50.1, . . . ,21.5,V,,,20030101153445,20030102023012
+// RecordIndicator,IntervalDate,IntervalValue1 . . . IntervalValueN,QualityMethod,ReasonCode,ReasonDescription,UpdateDateTime,MSATSLoadDateTime
+func (p *CsvProcessServiceImpl) handle300ToChannel(fields []string, currentNMI string, currentInterval int, fps *FileProcessServiceImpl, out chan<- entity.MeterReadingsEntity, fileCreationDateStr string) {
 	if len(fields) < 3 {
 		fps.addErrorRowCSV(fields, fmt.Errorf("not enough fields in 300 record"))
 		return
@@ -130,31 +127,31 @@ func (p *CsvProcessServiceImpl) handle300ToChannel(
 }
 
 // handle200 parses a 200 record
-// AT THIS STAGE, DATA IS CLEAN
-func (p *CsvProcessServiceImpl) handle200(fields []string, record int, fps *FileProcessServiceImpl) (string, int) {
+// AT THIS STAGE, DATA IS CLEAN, REMOVE ERROR VALIDATION TO IMPROVE PROCESSING SPEED
+func (p *CsvProcessServiceImpl) handle200(fields []string) (string, int) {
 	// if len(fields) <= 8 {
 	// 	err := fmt.Errorf("not enough fields in 200 record")
-	// 	log.Logger.Warn("malformed 200 record", zap.Int("line", record), zap.Strings("fields", fields), zap.Error(err))
+	// 	log.Logger.Warn("malformed 200 record", zap.Int("line", record), log.Anys("fields", fields), zap.Error(err))
 	// 	fps.addErrorRowCSV(fields, err)
 	// 	return "", 0
 	// }
 	// nmi := strings.TrimSpace(fields[1])
 	// if len(nmi) > 10 {
 	// 	err := fmt.Errorf("NMI too long")
-	// 	log.Logger.Warn("NMI too long", zap.Int("line", record), zap.Strings("fields", fields), zap.Error(err))
+	// 	log.Logger.Warn("NMI too long", zap.Int("line", record), log.Anys("fields", fields), zap.Error(err))
 	// 	fps.addErrorRowCSV(fields, err)
 	// 	return "", 0
 	// }
 	// ivalStr := strings.TrimSpace(fields[8])
 	// if ivalStr == "" {
 	// 	err := fmt.Errorf("interval value empty")
-	// 	log.Logger.Warn("malformed 200 record", zap.Int("line", record), zap.Strings("fields", fields), zap.Error(err))
+	// 	log.Logger.Warn("malformed 200 record", zap.Int("line", record), log.Anys("fields", fields), zap.Error(err))
 	// 	fps.addErrorRowCSV(fields, err)
 	// 	return "", 0
 	// }
 	// iv, err := strconv.Atoi(ivalStr)
 	// if err != nil {
-	// 	log.Logger.Warn("invalid interval value", zap.Int("line", record), zap.Strings("fields", fields), zap.Error(err))
+	// 	log.Logger.Warn("invalid interval value", zap.Int("line", record), log.Anys("fields", fields), zap.Error(err))
 	// 	fps.addErrorRowCSV(fields, err)
 	// 	return "", 0
 	// }
@@ -165,6 +162,10 @@ func (p *CsvProcessServiceImpl) handle200(fields []string, record int, fps *File
 }
 
 // ParseIntervalDates parses multiple date formats
+// Date formats:
+// CCYYMMDD 20030501
+// CCYYMMDDhhmm 200301011534
+// CCYYMMDDhhmmss 20030101153445
 func (p *CsvProcessServiceImpl) ParseIntervalDates(s string) (time.Time, error) {
 	formats := []string{"20060102", "20060102150405", "200601021504"}
 	var t time.Time

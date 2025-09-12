@@ -44,6 +44,7 @@ func DBWithCircuitBreaker(db *gorm.DB, fn func(*gorm.DB) error) (error, bool) {
 	return err, backoff
 }
 
+// to be plugged into batch insert statments
 func RetryWithCircuitBreaker(db *gorm.DB, fn func(*gorm.DB) error, maxRetries int) (error, bool) {
 	var lastErr error
 	var backoff bool
@@ -65,6 +66,7 @@ func RetryWithCircuitBreaker(db *gorm.DB, fn func(*gorm.DB) error, maxRetries in
 	return lastErr, false
 }
 
+// if errors fall in this categories, dont retry
 func BackOffError(err error) bool {
 	if err == nil {
 		return false
@@ -79,6 +81,6 @@ func BackOffError(err error) bool {
 		return true
 	}
 
-	// Otherwise, assume transient error (connection, deadlock, timeout, etc.)
+	// Otherwise, assume transient error (connection, timeout, etc.)
 	return false
 }

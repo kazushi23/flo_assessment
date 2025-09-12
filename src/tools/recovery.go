@@ -17,7 +17,7 @@ func Recover(c *gin.Context) {
 			// Log the panic with stack trace
 			zapFields := []zap.Field{
 				zap.Any("panic", r),
-				zap.String("stack", string(debug.Stack())),
+				log.Any("stack", string(debug.Stack())),
 			}
 			log.Logger.Error("Recovered from panic", zapFields...)
 

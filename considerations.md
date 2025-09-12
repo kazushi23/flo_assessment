@@ -236,6 +236,10 @@ NOW I WILL IMPLEMENT CHECKING. idea i to have 1 node for data preprocessing
 
 no more retry mechanism and processchunks needed
 
+cron => 1 node for preprocessing and ensuring data integrity. if file is malformed, reject
+file&csv processing services => process and store data in batch => speed and performance centric
+stagingmeterreadingentity & circuitbreaker & backoffandstorefirst() => for retry mechanism and single thread processing, comparing and updating/inserting of data
+
 
 this is a good assignment, the blank cheque made my mind travel to many places as the technical implementation is tied to buisnes requirements, eg. what is the data ingestion method? does data need to be real time? how often data processing occurs? hourly? so i can balance performance vs reliability etc. for now i go for performance.
 

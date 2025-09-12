@@ -88,7 +88,6 @@ func (f *FileCheckerServiceImpl) CheckNEMFile(path string) ([]ValidationError, e
 	headerFound := false
 	endFound := false
 	nemVersion := ""
-	// fileCreateDate := ""
 	currentNMI := ""           // track NMI from 200 record
 	currentIntervalLength := 0 // interval length from 200 record
 

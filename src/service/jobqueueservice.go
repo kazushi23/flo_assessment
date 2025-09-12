@@ -45,7 +45,7 @@ func (j *JobQueueServiceImpl) InitQueue(filePath string) error {
 		}
 		data, _ := json.Marshal(job)
 		if err := rc.RSet(key, data, 0).Err(); err != nil {
-			log.Logger.Error("Failed to set job in Redis", zap.String("file", filePath), zap.Error(err))
+			log.Logger.Error("Failed to set job in Redis", log.Any("file", filePath), zap.Error(err))
 			return err
 		}
 	}
@@ -71,13 +71,13 @@ func (j *JobQueueServiceImpl) RejectQueue(filePath string) error {
 	}
 	data, _ := json.Marshal(job)
 	if err := rc.RSet(key, data, 0).Err(); err != nil {
-		log.Logger.Error("Failed to mark job as reject", zap.String("file", filePath), zap.Error(err))
+		log.Logger.Error("Failed to mark job as reject", log.Any("file", filePath), zap.Error(err))
 		return err
 	}
 
 	// Add to reject set
 	if err := rc.SAdd(rc.Context(), "job_status:reject", filePath).Err(); err != nil {
-		log.Logger.Error("Failed to add job to reject set", zap.String("file", filePath), zap.Error(err))
+		log.Logger.Error("Failed to add job to reject set", log.Any("file", filePath), zap.Error(err))
 		return err
 	}
 
@@ -103,7 +103,7 @@ func (j *JobQueueServiceImpl) InProgressQueue(filePath string) error {
 	}
 	data, _ := json.Marshal(job)
 	if err := rc.RSet(key, data, 0).Err(); err != nil {
-		log.Logger.Error("Failed to mark job in_progress", zap.String("file", filePath), zap.Error(err))
+		log.Logger.Error("Failed to mark job in_progress", log.Any("file", filePath), zap.Error(err))
 		return err
 	}
 
@@ -130,12 +130,12 @@ func (j *JobQueueServiceImpl) HandleEndQueue(filePath string, processErr error) 
 		}
 		data, _ := json.Marshal(job)
 		if err := rc.RSet(key, data, 0).Err(); err != nil {
-			log.Logger.Error("Failed to mark job rejected", zap.String("file", filePath), zap.String("error", processErr.Error()), zap.Error(err))
+			log.Logger.Error("Failed to mark job rejected", log.Any("file", filePath), log.Any("error", processErr.Error()), zap.Error(err))
 			return err
 		}
 
-		if err := rc.SAdd(rc.Context(), "job_status:reject", filePath).Err(); err != nil {
-			log.Logger.Error("Failed to add job to reject set", zap.String("file", filePath), zap.Error(err))
+		if err := rc.SAdd(rc.Context(), "job_status:reject", filePath).Err(); err != nil { // add to reject queue
+			log.Logger.Error("Failed to add job to reject set", log.Any("file", filePath), zap.Error(err))
 		}
 	} else {
 		job = JobQueueStatus{
@@ -145,7 +145,7 @@ func (j *JobQueueServiceImpl) HandleEndQueue(filePath string, processErr error) 
 		}
 		data, _ := json.Marshal(job)
 		if err := rc.RSet(key, data, 0).Err(); err != nil {
-			log.Logger.Error("Failed to mark job success", zap.String("file", filePath), zap.Error(err))
+			log.Logger.Error("Failed to mark job success", log.Any("file", filePath), zap.Error(err))
 			return err
 		}
 	}
@@ -160,7 +160,7 @@ func (j *JobQueueServiceImpl) RetrieveRejectedJobs() ([]string, error) {
 		return nil, err
 	}
 
-	files, err := rc.SMembers(rc.Context(), "job_status:reject").Result()
+	files, err := rc.SMembers(rc.Context(), "job_status:reject").Result() // get all filepaths from reject queue
 	if err != nil {
 		return nil, err
 	}
@@ -175,8 +175,8 @@ func (j *JobQueueServiceImpl) RemoveFromReject(filePath string) error {
 		return err
 	}
 
-	if err := rc.SRem(rc.Context(), "job_status:reject", filePath).Err(); err != nil {
-		log.Logger.Error("Failed to remove job from reject set", zap.String("file", filePath), zap.Error(err))
+	if err := rc.SRem(rc.Context(), "job_status:reject", filePath).Err(); err != nil { // remove from reject queue
+		log.Logger.Error("Failed to remove job from reject set", log.Any("file", filePath), zap.Error(err))
 		return err
 	}
 

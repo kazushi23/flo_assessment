@@ -30,7 +30,7 @@ func init() {
 	fmt.Println("DSN:", dsn)
 	var err error
 
-	// CRITICAL FIX: Use Silent logger for bulk operations
+	// Use Silent logger for bulk operations
 	var newLogger logger.Interface
 	if toml.GetConfig().Environment == "production" { // or add your env check
 		newLogger = logger.Default.LogMode(logger.Silent) // NO SQL logging in production
@@ -48,7 +48,7 @@ func init() {
 
 	_db, err = gorm.Open(mysql.Open(dsn), &gorm.Config{
 		Logger:                                   newLogger,
-		SkipDefaultTransaction:                   true, // CRITICAL: Disable auto-transactions
+		SkipDefaultTransaction:                   true, // Disable auto-transactions
 		PrepareStmt:                              true, // Cache prepared statements
 		DisableForeignKeyConstraintWhenMigrating: true, // Faster migrations
 	})
