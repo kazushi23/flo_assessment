@@ -14,7 +14,7 @@
 9. validation for zip file, that goes into validation for csv
 10. improved/more efficient data reprocessing of failed batch
 11. load balancers, maybe spread data processing into multiple nodes from preprocessing server to limit server throttling
-12. 
+12. data ingestion + validation, worker pool and job queue, data processing and db insert,safety mechanism => spread into 4 nodes
 
 need to do validation? 100/200/300/400/500/900
 need to cater for 250/550? or only 100 - 200 - 300 - 900
